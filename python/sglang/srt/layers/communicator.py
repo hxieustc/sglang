@@ -403,7 +403,7 @@ class LayerCommunicator:
             server_args.enable_flashinfer_allreduce_fusion
             and not server_args.enable_adaptive_allreduce
         )
-        
+
         static_conditions_met = (
             (not self.is_last_layer)
             and (self._context.tp_size > 1)
@@ -606,31 +606,34 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states = layernorm(hidden_states)
         else:
             server_args = get_global_server_args()
-            
+
             # Use adaptive allreduce if enabled
             if server_args.enable_adaptive_allreduce:
                 from sglang.srt.layers.allreduce import get_adaptive_allreduce_layer
                 from sglang.srt.layers.flashinfer_comm_fusion import _workspace_manager
-                
+
                 # Get adaptive allreduce layer for this hidden_size
                 hidden_size = hidden_states.shape[-1]
                 flashinfer_workspace = (
-                    _workspace_manager.workspace_tensor 
-                    if _workspace_manager.initialized 
+                    _workspace_manager.workspace_tensor
+                    if _workspace_manager.initialized
                     else None
                 )
-                
+
                 adaptive_layer = get_adaptive_allreduce_layer(
                     hidden_size=hidden_size,
                     flashinfer_workspace_tensor=flashinfer_workspace,
                 )
-                
+
                 if adaptive_layer is not None:
-                    # Use adaptive allreduce layer
-                    hidden_states, residual = adaptive_layer.select_backend_and_allreduce(
-                        hidden_states=hidden_states,
-                        residual=residual,
-                        layernorm=layernorm,
+                    # Use adaptive allreduce layer with cross-layer fusion support
+                    hidden_states, residual = (
+                        adaptive_layer.select_backend_and_allreduce(
+                            hidden_states=hidden_states,
+                            residual=residual,
+                            layernorm=layernorm,
+                            enable_cross_layer_fusion=True,  # Enable cross-layer fusion for DeepSeek-V3/Qwen3-MoE
+                        )
                     )
                 else:
                     # Fallback to standard NCCL if adaptive layer is not available
