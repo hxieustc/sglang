@@ -124,7 +124,7 @@ jobs:
           docker pull "${image}"
 
           echo "Saving to temp file: ${tmp_path}"
-          docker save "${image}" -o "${tmp_path}"
+          sudo docker save "${image}" -o "${tmp_path}"
 
           echo "Moving to final path: ${final_path}"
           sudo mv -f "${tmp_path}" "${final_path}"
