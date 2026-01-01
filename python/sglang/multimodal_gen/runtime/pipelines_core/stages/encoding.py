@@ -37,7 +37,6 @@ class EncodingStage(PipelineStage):
         super().__init__()
         self.vae: ParallelTiledVAE = vae
 
-
     def load_model(self):
         if self.server_args.vae_cpu_offload:
             self.vae.to(get_local_torch_device())
@@ -45,7 +44,6 @@ class EncodingStage(PipelineStage):
     def offload_model(self):
         if self.server_args.vae_cpu_offload:
             self.vae.to("cpu")
-
 
     @torch.no_grad()
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -109,6 +107,5 @@ class EncodingStage(PipelineStage):
 
         # Update batch with encoded latents
         batch.latents = latents
-
 
         return batch
