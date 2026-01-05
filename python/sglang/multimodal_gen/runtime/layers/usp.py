@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 import torch.distributed._functional_collectives as ft_c
 from packaging.version import parse
 from torch.distributed.tensor.experimental._attention import _cp_options
@@ -37,13 +38,18 @@ def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
+    pg_world_size = dist.get_world_size(ulysses_pg)
+    assert (
+        x.numel() % pg_world_size == 0
+    ), f"USP all_to_all_single requires numel divisible by pg_world_size, got numel={x.numel()} and pg_world_size={pg_world_size}"
     x = x.flatten()
-    x = ft_c.all_to_all_single(
-        x, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
-    )
-    x = _maybe_wait(x)
-    x = x.reshape(x_shape)
-    return x
+    # NOTE: We intentionally use c10d all_to_all_single instead of the functional
+    # collectives variant here. In some environments (observed with 8 GPUs), the
+    # functional path can surface as NCCL Error 1: unhandled cuda error.
+    out = torch.empty_like(x)
+    dist.all_to_all_single(out, x, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg)
+    out = out.reshape(x_shape)
+    return out
 
 
 def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
