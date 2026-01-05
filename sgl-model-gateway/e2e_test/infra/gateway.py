@@ -175,7 +175,7 @@ class Gateway:
             self.pd_mode = False
             self.igw_mode = True
             self._launch(
-                mode_args=["--igw-mode"],
+                mode_args=["--enable-igw"],
                 timeout=timeout,
                 show_output=show_output,
                 extra_args=extra_args,

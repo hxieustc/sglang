@@ -1,4 +1,103 @@
-"""Pytest configuration for E2E tests."""
+"""Pytest configuration for E2E tests.
+
+Markers
+-------
+This module defines several pytest markers for configuring E2E tests:
+
+@pytest.mark.model(name, scope="session")
+    Specify which model to use for the test.
+
+    Args:
+        name: Model ID from MODEL_SPECS (e.g., "llama-8b", "qwen-7b")
+        scope: "session" (default) or "class"
+            - session: Pre-launched at test session start. Stays running.
+            - class: Launched on-demand when test class starts.
+
+    GPU Resource Management:
+        When GPUs are limited (e.g., 4 GPUs, 6 models), the model pool uses
+        LRU (Least Recently Used) eviction:
+        1. Session models are pre-launched until GPUs are full
+        2. Overflow models are queued for on-demand launch
+        3. When a queued model is needed, LRU model is evicted
+        4. Evicted models go back to queue and can be re-launched later
+
+    Examples:
+        @pytest.mark.model("llama-8b")  # session scope, pre-launched
+        @pytest.mark.model("qwen-72b", scope="class")  # on-demand only
+
+@pytest.mark.workers(count=1, prefill=None, decode=None)
+    Configure worker topology for the test.
+
+    Args:
+        count: Number of regular workers (default: 1)
+        prefill: Number of prefill workers for PD disaggregation
+        decode: Number of decode workers for PD disaggregation
+
+    Examples:
+        @pytest.mark.workers(count=3)  # 3 regular workers
+        @pytest.mark.workers(prefill=2, decode=2)  # PD mode
+
+@pytest.mark.gateway(policy="round_robin", timeout=None, extra_args=None)
+    Configure the gateway/router.
+
+    Args:
+        policy: Routing policy ("round_robin", "random", etc.)
+        timeout: Startup timeout in seconds
+        extra_args: Additional CLI arguments for the router
+
+    Examples:
+        @pytest.mark.gateway(policy="random")
+        @pytest.mark.gateway(extra_args=["--cache-routing"])
+
+@pytest.mark.e2e
+    Mark test as an end-to-end test requiring GPU workers.
+
+@pytest.mark.slow
+    Mark test as slow-running.
+
+Fixtures
+--------
+model_pool: Session-scoped fixture managing SGLang worker processes.
+setup_backend: Class-scoped fixture that launches gateway + provides client.
+
+Usage Examples
+--------------
+Basic test with default model:
+
+    @pytest.mark.e2e
+    @pytest.mark.parametrize("setup_backend", ["http"], indirect=True)
+    class TestBasic:
+        def test_chat(self, setup_backend):
+            backend, model, client, gateway = setup_backend
+            response = client.chat.completions.create(...)
+
+Test with specific model and multiple backends:
+
+    @pytest.mark.e2e
+    @pytest.mark.model("qwen-7b")
+    @pytest.mark.parametrize("setup_backend", ["grpc", "http"], indirect=True)
+    class TestQwen:
+        def test_generate(self, setup_backend):
+            ...
+
+Large model loaded on-demand (class scope):
+
+    @pytest.mark.e2e
+    @pytest.mark.model("llama-70b", scope="class")
+    @pytest.mark.parametrize("setup_backend", ["http"], indirect=True)
+    class TestLargeModel:
+        def test_inference(self, setup_backend):
+            ...
+
+PD disaggregation mode:
+
+    @pytest.mark.e2e
+    @pytest.mark.workers(prefill=1, decode=1)
+    @pytest.mark.parametrize("setup_backend", ["pd"], indirect=True)
+    class TestPD:
+        def test_pd_inference(self, setup_backend):
+            ...
+"""
 
 from __future__ import annotations
 
