@@ -65,6 +65,9 @@ class HiCacheNixl(HiCacheStorage):
 
         self.is_mla_model = storage_config.is_mla_model
         self.is_zero_copy = False
+        self.storage_config = storage_config
+        self.backup_skip = self.is_mla_model and storage_config.tp_rank != 0
+        self.mem_pool_device = None
 
         model_name = "-".join(model_name.split("/")) if model_name else ""
 
@@ -285,6 +288,17 @@ class HiCacheNixl(HiCacheStorage):
         target_locations: Optional[List[int]] = None,
         target_sizes: Optional[List[int]] = None,
     ) -> bool:
+        if self.backup_skip:
+            logger.info(
+                "HiCacheNixl batch_set skipped on MLA backup rank: mem_pool_device_type=%s is_mla_model=%s tp_rank=%s backup_skip=%s keys=%s",
+                type(self.mem_pool_device).__name__ if self.mem_pool_device else None,
+                self.storage_config.is_mla_model,
+                self.storage_config.tp_rank,
+                self.backup_skip,
+                len(keys),
+            )
+            return True
+
         if not keys or (not values and (not target_locations or not target_sizes)):
             logger.error("Keys or values were not passed")
             return False
@@ -318,6 +332,7 @@ class HiCacheNixl(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        self.mem_pool_device = getattr(mem_pool_host, "device_pool", None)
 
         # enable zero-copy automatically if mem layout is page_first or page_first_direct
         self.is_zero_copy = self.mem_pool_host.layout in [
@@ -327,6 +342,13 @@ class HiCacheNixl(HiCacheStorage):
 
         logger.info(
             f"HiCacheNixl: Registered mem_pool_host with layout {self.mem_pool_host.layout}, zero_copy set to {self.is_zero_copy}"
+        )
+        logger.info(
+            "HiCacheNixl diagnostics: mem_pool_device_type=%s is_mla_model=%s tp_rank=%s backup_skip=%s",
+            type(self.mem_pool_device).__name__ if self.mem_pool_device else None,
+            self.storage_config.is_mla_model,
+            self.storage_config.tp_rank,
+            self.backup_skip,
         )
 
     def exists(self, key: str) -> bool:
@@ -343,7 +365,7 @@ class HiCacheNixl(HiCacheStorage):
         if self.is_zero_copy:
             key_list = self._get_key_list_from_meta(keys)
             key_denominator = (
-                1 if not self.is_mla_model else 2
+                1 if self.is_mla_model else 2
             )  # MLA model only has k buffer, no separate v buffer
         else:
             key_list = [self._get_suffixed_key(key) for key in keys]
@@ -603,6 +625,17 @@ class HiCacheNixl(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if self.backup_skip:
+            logger.info(
+                "HiCacheNixl batch_set_v1 skipped on MLA backup rank: mem_pool_device_type=%s is_mla_model=%s tp_rank=%s backup_skip=%s keys=%s host_indices=%s",
+                type(self.mem_pool_device).__name__ if self.mem_pool_device else None,
+                self.storage_config.is_mla_model,
+                self.storage_config.tp_rank,
+                self.backup_skip,
+                len(keys),
+                host_indices.numel() if host_indices is not None else None,
+            )
+            return [True] * len(keys)
 
         if len(keys) == 0:
             return []
