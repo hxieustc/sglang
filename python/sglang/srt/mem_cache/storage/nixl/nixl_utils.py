@@ -284,6 +284,12 @@ class NixlFileManager:
             logger.error(f"Failed to close file descriptor {fd}: {e}")
             return False
 
+    def close_nixl_tuples(self, tuples: List[Tuple[int, int, int, str]]) -> None:
+        """Close file descriptors stored in NIXL FILE tuples."""
+        for _, _, fd, _ in tuples:
+            if fd is not None and fd >= 0:
+                self.close_file(fd)
+
     def files_to_nixl_tuples(
         self, file_paths: List[str]
     ) -> List[Tuple[int, int, int, str]]:
@@ -292,8 +298,7 @@ class NixlFileManager:
         for path in file_paths:
             if (fd := self.open_file(path)) is None:
                 # Clean up on failure
-                for t in tuples:
-                    self.close_file(t[2])
+                self.close_nixl_tuples(tuples)
                 return []
             tuples.append((0, 0, fd, path))
         return tuples

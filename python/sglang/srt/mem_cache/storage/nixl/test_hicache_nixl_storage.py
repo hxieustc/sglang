@@ -5,6 +5,8 @@ import unittest
 from typing import List
 from unittest.mock import MagicMock
 
+os.environ.setdefault("FLASHINFER_WORKSPACE_BASE", "/tmp")
+
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
@@ -23,6 +25,7 @@ class TestNixlUnified(unittest.TestCase):
         # Create test directories
         self.test_dir = "/tmp/test_nixl_unified"
         os.makedirs(self.test_dir, exist_ok=True)
+        os.environ["SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR"] = self.test_dir
 
         # Mock NIXL agent for registration tests
         self.mock_agent = MagicMock()
@@ -37,17 +40,17 @@ class TestNixlUnified(unittest.TestCase):
         self.storage_config = HiCacheStorageConfig(
             tp_rank=0,
             tp_size=2,
+            pp_rank=0,
+            pp_size=1,
             is_mla_model=False,
+            enable_storage_metrics=False,
             is_page_first_layout=False,
             model_name="test_model",
+            extra_config={"plugin": {"posix": {"active": True}}},
         )
 
         try:
-            self.hicache = HiCacheNixl(
-                storage_config=self.storage_config,
-                file_path=self.test_dir,
-                plugin="POSIX",
-            )
+            self.hicache = HiCacheNixl(storage_config=self.storage_config)
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
 
@@ -56,7 +59,7 @@ class TestNixlUnified(unittest.TestCase):
         if os.path.exists(self.test_dir):
             import shutil
 
-            shutil.rmtree(self.test_dir)
+            shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def delete_test_file(self, file_path: str) -> bool:
         """Helper method to delete a test file.
@@ -227,6 +230,7 @@ class TestNixlUnified(unittest.TestCase):
         tuples = self.file_manager.files_to_nixl_tuples([test_file])
         self.assertIsNotNone(tuples)
         self.assertTrue(len(tuples) > 0)
+        self.file_manager.close_nixl_tuples(tuples)
 
     def test_error_handling(self):
         """Test error handling in file operations."""
@@ -250,20 +254,37 @@ class TestNixlUnified(unittest.TestCase):
         tensors = [torch.randn(5, 5) for _ in range(3)]
         self.assertIsNotNone(self.hicache.register_buffers(tensors))
 
+    def test_register_files_closes_file_descriptors(self):
+        """Test that register_files closes all opened file descriptors."""
+        files = [os.path.join(self.test_dir, f"fd_test_file_{i}.bin") for i in range(3)]
+        for file in files:
+            self.file_manager.create_file(file)
+
+        captured_fds = []
+
+        def register_and_capture(items, mem_type):
+            self.assertEqual(mem_type, "FILE")
+            captured_fds.extend(item[2] for item in items)
+            for fd in captured_fds:
+                os.fstat(fd)
+            return "mock_registered_memory"
+
+        self.hicache.registration._register_memory = register_and_capture
+
+        self.assertEqual(self.hicache.register_files(files), "mock_registered_memory")
+        self.assertEqual(len(captured_fds), len(files))
+
+        for fd in captured_fds:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
     def test_register_files_with_tuples(self):
-        """Test registration of files using NIXL tuples."""
+        """Test registration of files using file paths."""
         files = [os.path.join(self.test_dir, f"test_file_{i}.bin") for i in range(3)]
         for file in files:
             self.file_manager.create_file(file)
 
-        # Create tuples and register
-        tuples = self.file_manager.files_to_nixl_tuples(files)
-        self.hicache.register_files(tuples)
-
-        # Verify tuples
-        self.assertEqual(len(tuples), len(files))
-        for t, f in zip(tuples, files):
-            self.assertEqual(t[3], f)  # Check file path
+        self.assertIsNotNone(self.hicache.register_files(files))
 
 
 if __name__ == "__main__":
