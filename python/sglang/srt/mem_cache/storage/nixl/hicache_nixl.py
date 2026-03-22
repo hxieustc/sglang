@@ -221,7 +221,12 @@ class HiCacheNixl(HiCacheStorage):
                     return False
         finally:
             if self.backend_selector.mem_type == "FILE":
+                start_time = time.perf_counter()
                 self.file_manager.close_nixl_tuples(tuples)
+                end_time = time.perf_counter()
+                elapsed_time_ms = (end_time - start_time) * 1000
+                logger.debug(f"NIXL _execute_transfer: close files {len(tuples)=}, {elapsed_time_ms=}")
+
 
     def get(
         self,
