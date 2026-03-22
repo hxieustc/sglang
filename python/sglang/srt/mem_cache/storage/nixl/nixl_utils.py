@@ -238,7 +238,6 @@ class NixlFileManager:
             else self._get_default_max_open_files()
         )
         self._fd_cache: OrderedDict[str, int] = OrderedDict()
-        self._fd_refcounts: dict[str, int] = {}
         self._lock = threading.Lock()
         if base_dir == "":
             logger.debug(f"Initialized file manager without a base directory")
@@ -292,10 +291,11 @@ class NixlFileManager:
             return False
 
     def open_file(self, file_path: str) -> Optional[int]:
-        """Open a file (or reuse a cached descriptor) and return its file descriptor."""
+        """Open a file (or reuse a cached base descriptor) and return its file descriptor."""
         with self._lock:
-            if file_path in self._fd_cache:
-                return self._fd_cache[file_path]
+            cached_fd = self._fd_cache.get(file_path)
+            if cached_fd is not None:
+                return cached_fd
 
         try:
             fd = os.open(file_path, os.O_RDWR)
@@ -313,7 +313,6 @@ class NixlFileManager:
                 return cached_fd
 
             self._fd_cache[file_path] = fd
-            self._fd_refcounts[file_path] = 0
             self._evict_idle_fds_locked()
             return fd
 
@@ -327,53 +326,58 @@ class NixlFileManager:
             return False
 
     def _acquire_file(self, file_path: str) -> Optional[int]:
-        fd = self.open_file(file_path)
-        if fd is None:
-            return None
+        with self._lock:
+            base_fd = self._fd_cache.get(file_path)
+            if base_fd is not None:
+                try:
+                    return os.dup(base_fd)
+                except OSError as e:
+                    logger.error(f"Failed to dup file descriptor for {file_path}: {e}")
+                    return None
 
         try:
-            os.lseek(fd, 0, os.SEEK_SET)
-        except OSError as e:
-            logger.error(f"Failed to reset file offset for {file_path}: {e}")
+            fd = os.open(file_path, os.O_RDWR)
+        except Exception as e:
+            logger.error(f"Failed to open file {file_path}: {e}")
             return None
 
         with self._lock:
-            self._fd_refcounts[file_path] = self._fd_refcounts.get(file_path, 0) + 1
-        return fd
+            cached_fd = self._fd_cache.get(file_path)
+            if cached_fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    return os.dup(cached_fd)
+                except OSError as e:
+                    logger.error(f"Failed to dup file descriptor for {file_path}: {e}")
+                    return None
 
-    def _release_file(self, file_path: str) -> None:
-        with self._lock:
-            if file_path not in self._fd_refcounts:
-                return
-            if self._fd_refcounts[file_path] > 0:
-                self._fd_refcounts[file_path] -= 1
+            self._fd_cache[file_path] = fd
+            self._evict_idle_fds_locked()
+            try:
+                return os.dup(fd)
+            except OSError as e:
+                logger.error(f"Failed to dup file descriptor for {file_path}: {e}")
+                return None
 
     def _evict_idle_fds_locked(self) -> None:
         while len(self._fd_cache) > self.max_open_files:
-            evict_path = None
-            evict_fd = None
-            for path, fd in self._fd_cache.items():
-                if self._fd_refcounts.get(path, 0) == 0:
-                    evict_path = path
-                    evict_fd = fd
-                    break
-            if evict_path is None:
-                break
-            self._fd_cache.pop(evict_path, None)
-            self._fd_refcounts.pop(evict_path, None)
+            evict_path, evict_fd = self._fd_cache.popitem(last=False)
             self.close_file(evict_fd)
 
     def release_nixl_tuples(self, tuples: List[Tuple[int, int, int, str]]) -> None:
-        """Release file-descriptor references stored in NIXL FILE tuples."""
-        for _, _, _fd, path in tuples:
-            self._release_file(path)
+        """Close per-transfer file descriptors stored in NIXL FILE tuples."""
+        for _, _, fd, _path in tuples:
+            if fd is not None and fd >= 0:
+                self.close_file(fd)
 
     def close_all_files(self) -> None:
         """Close all cached file descriptors."""
         with self._lock:
             cached_items = list(self._fd_cache.items())
             self._fd_cache.clear()
-            self._fd_refcounts.clear()
 
         for _path, fd in cached_items:
             self.close_file(fd)

@@ -257,8 +257,8 @@ class TestNixlUnified(unittest.TestCase):
         tensors = [torch.randn(5, 5) for _ in range(3)]
         self.assertIsNotNone(self.hicache.register_buffers(tensors))
 
-    def test_register_files_reuses_cached_file_descriptors(self):
-        """Test that register_files keeps descriptors cached for reuse."""
+    def test_register_files_closes_transfer_fds_and_keeps_base_cache(self):
+        """Test that register_files closes duped transfer FDs while caching base FDs."""
         files = [os.path.join(self.test_dir, f"fd_test_file_{i}.bin") for i in range(3)]
         for file in files:
             self.file_manager.create_file(file)
@@ -278,6 +278,12 @@ class TestNixlUnified(unittest.TestCase):
         self.assertEqual(len(captured_fds), len(files))
 
         for fd in captured_fds:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+        cached_base_fds = list(self.hicache.file_manager._fd_cache.values())
+        self.assertEqual(len(cached_base_fds), len(files))
+        for fd in cached_base_fds:
             os.fstat(fd)
 
     def test_close_releases_cached_file_descriptors(self):
@@ -286,14 +292,17 @@ class TestNixlUnified(unittest.TestCase):
         self.hicache.file_manager.create_file(test_file)
 
         tuples = self.hicache.file_manager.files_to_nixl_tuples([test_file])
-        fd = tuples[0][2]
+        transfer_fd = tuples[0][2]
+        base_fd = self.hicache.file_manager._fd_cache[test_file]
         self.hicache.file_manager.release_nixl_tuples(tuples)
 
-        os.fstat(fd)
+        with self.assertRaises(OSError):
+            os.fstat(transfer_fd)
+        os.fstat(base_fd)
         self.hicache.close()
 
         with self.assertRaises(OSError):
-            os.fstat(fd)
+            os.fstat(base_fd)
 
     def test_register_files_with_tuples(self):
         """Test registration of files using file paths."""
