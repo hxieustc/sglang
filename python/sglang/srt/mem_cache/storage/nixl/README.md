@@ -67,6 +67,19 @@ Read and write transfers are chunked and fanned out across multiple NIXL agents 
 
 This design keeps backend plugin init params clean while allowing transfer parallelism to be tuned independently.
 
+### File Layout for FILE Backends
+
+For FILE-based plugins such as POSIX / GDS / GDS_MT / 3FS, NIXL stores KV cache data as files under the configured storage directory.
+
+NIXL now supports two layout strategies:
+
+- `hashed2` (default): `base_dir/<first2>/<next2>/<full_key>`
+- `flat`: `base_dir/<full_key>`
+
+The default `hashed2` layout spreads files across subdirectories using the first few characters of the hash-like cache key. This reduces the chance of creating a single very hot directory with a very large number of entries, which can otherwise stress directory metadata lookup and inode access on some filesystems.
+
+Use `flat` only if you explicitly want the original single-directory layout for compatibility or controlled experiments.
+
 ## Using NIXL as the HiCache Storage Backend
 
 ### 1. How Backend Plugin Selection Works
@@ -152,6 +165,7 @@ Example TOML snippet showing both backend config and runtime transfer scaling:
 ```toml
 [runtime]
 numjobs = 4
+file_layout = "hashed2"
 
 [plugin.posix]
 active = true
@@ -180,7 +194,7 @@ python3 -m sglang.launch_server \
   --hicache-size 64 \
   --hicache-write-policy write_through \
   --hicache-storage-backend nixl \
-  --hicache-storage-backend-extra-config "{'use_uring': 'true', 'numjobs': 4}"
+  --hicache-storage-backend-extra-config "{'use_uring': 'true', 'numjobs': 4, 'file_layout': 'hashed2'}"
 ```
 
 ⚠️ **Note**:
@@ -236,6 +250,13 @@ Tests for this integration, a test suite can be found at `test_hicache_nixl_stor
 - Default `numjobs=4` agent-pool creation
 - Runtime override of `numjobs`
 
+### File Layout Tests (5 tests)
+- Default `hashed2` path generation
+- Explicit `flat` layout path generation
+- Invalid layout rejection
+- HiCache default file layout propagation
+- HiCache runtime file layout override propagation
+
 ## Expected Output
 
 When tests run successfully, you should see:
@@ -263,6 +284,12 @@ If transfer throughput is lower than expected:
 - Check the effective `numjobs` value in `extra_config`
 - Increase `numjobs` only when the backend and filesystem can sustain parallel transfer work
 - For single-threaded or very small batch workloads, larger `numjobs` may add overhead rather than improve throughput
+
+### File Layout Tuning
+If FILE backend metadata access becomes a bottleneck:
+- keep the default `hashed2` layout for better directory fanout
+- consider `flat` only for compatibility testing or if your filesystem performs better with a single directory
+- when comparing layouts, measure metadata-heavy workloads rather than only large sequential transfer bandwidth
 
 ## File Structure
 

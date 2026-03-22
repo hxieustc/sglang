@@ -224,6 +224,28 @@ class TestNixlUnified(unittest.TestCase):
         self.assertTrue(self.delete_test_file(test_file))
         self.assertFalse(os.path.exists(test_file))
 
+    def test_default_file_layout_is_hashed2(self):
+        """Default file layout should use a 2-level hashed directory structure."""
+        key = "abcdef0123456789"
+        expected = os.path.join(self.test_dir, "ab", "cd", key)
+
+        self.assertEqual(self.file_manager.layout, "hashed2")
+        self.assertEqual(self.file_manager.get_file_path(key), expected)
+
+    def test_flat_file_layout(self):
+        """Flat layout should place files directly under the base directory."""
+        flat_manager = NixlFileManager(self.test_dir, layout="flat")
+        key = "abcdef0123456789"
+
+        self.assertEqual(
+            flat_manager.get_file_path(key), os.path.join(self.test_dir, key)
+        )
+
+    def test_invalid_file_layout_raises(self):
+        """Unknown file layouts should fail fast."""
+        with self.assertRaises(ValueError):
+            NixlFileManager(self.test_dir, layout="unknown")
+
     def test_create_nixl_tuples(self):
         """Test creation of NIXL tuples."""
         test_file = os.path.join(self.test_dir, "test_file.bin")
@@ -335,6 +357,33 @@ class TestNixlUnified(unittest.TestCase):
             self.assertEqual(hicache.num_jobs, 2)
             self.assertEqual(len(hicache.read_contexts), 2)
             self.assertEqual(len(hicache.write_contexts), 2)
+        finally:
+            hicache.close()
+
+    def test_hicache_default_file_layout_is_hashed2(self):
+        """HiCache should default to the hashed2 NIXL file layout."""
+        self.assertEqual(self.hicache.file_manager.layout, "hashed2")
+
+    def test_hicache_runtime_file_layout_override(self):
+        """Runtime file_layout override should be propagated to NixlFileManager."""
+        storage_config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=2,
+            pp_rank=0,
+            pp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name="test_model",
+            extra_config={
+                "runtime": {"file_layout": "flat"},
+                "plugin": {"posix": {"active": True}},
+            },
+        )
+
+        hicache = HiCacheNixl(storage_config=storage_config)
+        try:
+            self.assertEqual(hicache.file_manager.layout, "flat")
         finally:
             hicache.close()
 

@@ -64,11 +64,14 @@ class HiCacheNixl(HiCacheStorage):
 
         # select the NIXL backend plugin from extra_config or environment variable
         plugin = nixlconfig.get_specified_plugin()
+        file_layout = str(
+            nixlconfig.get_runtime_param("file_layout", "hashed2")
+        ).lower()
 
         # Might be better to be unified across HiCache backends and moved to HiCacheController
         file_path = envs.SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR.get() or file_path
         self.file_manager = (
-            NixlFileManager(file_path)
+            NixlFileManager(file_path, layout=file_layout)
             if plugin not in NixlBackendSelection.OBJ_PLUGINS
             else None
         )

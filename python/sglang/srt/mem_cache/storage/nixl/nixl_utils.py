@@ -234,18 +234,28 @@ class NixlRegistration:
 class NixlFileManager:
     """Handles file system operations for NIXL."""
 
-    def __init__(self, base_dir: str):
+    SUPPORTED_LAYOUTS = {"hashed2", "flat"}
+
+    def __init__(self, base_dir: str, layout: str = "hashed2"):
         """
         Initialize file manager.
         Args:
             base_dir: Base directory for storing tensor files
+            layout: File layout strategy, either "hashed2" or "flat"
         """
         self.base_dir = base_dir
+        self.layout = layout
+        if self.layout not in self.SUPPORTED_LAYOUTS:
+            raise ValueError(
+                f"Unsupported NIXL file layout '{self.layout}', expected one of {sorted(self.SUPPORTED_LAYOUTS)}"
+            )
         if base_dir == "":
             logger.debug(f"Initialized file manager without a base directory")
         else:
             os.makedirs(base_dir, exist_ok=True)
-            logger.debug(f"Initialized file manager with base directory: {base_dir}")
+            logger.debug(
+                f"Initialized file manager with base directory: {base_dir}, layout: {self.layout}"
+            )
 
     def clear(self) -> None:
         """Clear all files in the base directory."""
@@ -265,6 +275,12 @@ class NixlFileManager:
 
     def get_file_path(self, key: str) -> str:
         """Get full file path for a given key."""
+        if self.layout == "flat":
+            return os.path.join(self.base_dir, key)
+        if self.layout == "hashed2":
+            level1 = key[:2] if len(key) >= 2 else key
+            level2 = key[2:4] if len(key) >= 4 else "__"
+            return os.path.join(self.base_dir, level1, level2, key)
         return os.path.join(self.base_dir, key)
 
     def create_file(self, file_path: str) -> bool:
