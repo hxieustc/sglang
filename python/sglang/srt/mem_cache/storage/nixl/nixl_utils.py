@@ -10,6 +10,8 @@ logger = logging.getLogger(__name__)
 class NixlBackendConfig:
     """Handles NIXL backend configurations"""
 
+    RUNTIME_ONLY_KEYS = {"runtime", "numjobs"}
+
     def __init__(self, config: Optional[dict[str, str]] = None):
         """Initialize backend configuration.
         Args:
@@ -63,9 +65,20 @@ class NixlBackendConfig:
             config_data = self.config
 
         for key, value in config_data.items():
+            if key in self.RUNTIME_ONLY_KEYS:
+                continue
             initparams[key] = str(value)
 
         return initparams
+
+    def get_runtime_param(
+        self, key: str, default: Optional[Any] = None
+    ) -> Optional[Any]:
+        """Get runtime-only params that should not be passed to backend init."""
+        runtime_cfg = self.config.get("runtime", {})
+        if key in runtime_cfg:
+            return runtime_cfg[key]
+        return self.config.get(key, default)
 
 
 class NixlBackendSelection:

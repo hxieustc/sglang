@@ -1,3 +1,4 @@
+import concurrent.futures
 import logging
 import time
 import uuid
@@ -40,6 +41,12 @@ class _NixlAgentContext:
     agent: Any
     registration: NixlRegistration
     backend_selector: NixlBackendSelection
+
+
+@dataclass
+class _NixlTransferChunk:
+    keys: List[str]
+    buffers: List[torch.Tensor | tuple]
 
 
 class HiCacheNixl(HiCacheStorage):
@@ -87,11 +94,24 @@ class HiCacheNixl(HiCacheStorage):
         self._agent_config = agent_config
         self._nixlconfig = nixlconfig
         self._plugin = plugin
+        self.num_jobs = max(1, int(nixlconfig.get_runtime_param("numjobs", 4)))
 
         self.query_ctx = self._create_agent_context("query")
         self.backend_selector = self.query_ctx.backend_selector
-        self.read_ctx = self._create_agent_context("read")
-        self.write_ctx = self._create_agent_context("write")
+        self.read_contexts = [
+            self._create_agent_context(f"read_{i}") for i in range(self.num_jobs)
+        ]
+        self.write_contexts = [
+            self._create_agent_context(f"write_{i}") for i in range(self.num_jobs)
+        ]
+        self.read_ctx = self.read_contexts[0]
+        self.write_ctx = self.write_contexts[0]
+        self.read_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.num_jobs, thread_name_prefix="HiCacheNixlRead"
+        )
+        self.write_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.num_jobs, thread_name_prefix="HiCacheNixlWrite"
+        )
 
         self.agent_name = self.read_ctx.agent_name
         self.agent = self.read_ctx.agent
@@ -126,6 +146,59 @@ class HiCacheNixl(HiCacheStorage):
             registration=NixlRegistration(agent),
             backend_selector=backend_selector,
         )
+
+    def _chunk_transfer_items(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor | tuple],
+        max_chunks: int,
+    ) -> List[_NixlTransferChunk]:
+        if len(keys) != len(buffers):
+            raise ValueError("Mismatch between keys and buffers lengths")
+        if not keys:
+            return []
+
+        chunk_count = min(max_chunks, len(keys))
+        base, remainder = divmod(len(keys), chunk_count)
+        chunks = []
+        start = 0
+        for i in range(chunk_count):
+            size = base + (1 if i < remainder else 0)
+            end = start + size
+            chunks.append(
+                _NixlTransferChunk(keys=keys[start:end], buffers=buffers[start:end])
+            )
+            start = end
+        return chunks
+
+    def _execute_transfer_parallel(
+        self,
+        buffers: List[torch.Tensor | tuple],
+        keys: List[str],
+        direction: str,
+        contexts: List[_NixlAgentContext],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ) -> bool:
+        if len(buffers) != len(keys):
+            logger.error("Mismatch between number of tensors/buffers and files/objects")
+            return False
+        if not keys:
+            return True
+        if len(contexts) == 1 or len(keys) == 1:
+            return self._execute_transfer(buffers, keys, direction, contexts[0])
+
+        chunks = self._chunk_transfer_items(keys, buffers, len(contexts))
+        futures = [
+            executor.submit(
+                self._execute_transfer,
+                chunk.buffers,
+                chunk.keys,
+                direction,
+                contexts[i],
+            )
+            for i, chunk in enumerate(chunks)
+        ]
+        return all(future.result() for future in futures)
 
     def register_buffers(
         self,
@@ -299,9 +372,17 @@ class HiCacheNixl(HiCacheStorage):
 
         if self.backend_selector.mem_type == "FILE":
             file_paths = [self.file_manager.get_file_path(key) for key in suffixed_keys]
-            success = self._execute_transfer(dest, file_paths, "READ", self.read_ctx)
+            success = self._execute_transfer_parallel(
+                dest, file_paths, "READ", self.read_contexts, self.read_executor
+            )
         else:
-            success = self._execute_transfer(dest, suffixed_keys, "READ", self.read_ctx)
+            success = self._execute_transfer_parallel(
+                dest,
+                suffixed_keys,
+                "READ",
+                self.read_contexts,
+                self.read_executor,
+            )
         return target_locations if success and not target_sizes else [None] * len(keys)
 
     def set(
@@ -342,10 +423,16 @@ class HiCacheNixl(HiCacheStorage):
                     logger.error(f"Failed to create file {file_path}")
                     return False
                 file_paths.append(file_path)
-            return self._execute_transfer(values, file_paths, "WRITE", self.write_ctx)
+            return self._execute_transfer_parallel(
+                values, file_paths, "WRITE", self.write_contexts, self.write_executor
+            )
         else:  # mem_type == "OBJ"
-            return self._execute_transfer(
-                values, suffixed_keys, "WRITE", self.write_ctx
+            return self._execute_transfer_parallel(
+                values,
+                suffixed_keys,
+                "WRITE",
+                self.write_contexts,
+                self.write_executor,
             )
 
     ############################################################################
@@ -495,9 +582,13 @@ class HiCacheNixl(HiCacheStorage):
 
         if self.backend_selector.mem_type == "FILE":
             file_paths = [self.file_manager.get_file_path(key) for key in key_strs]
-            success = self._execute_transfer(dest, file_paths, "READ", self.read_ctx)
+            success = self._execute_transfer_parallel(
+                dest, file_paths, "READ", self.read_contexts, self.read_executor
+            )
         else:
-            success = self._execute_transfer(dest, key_strs, "READ", self.read_ctx)
+            success = self._execute_transfer_parallel(
+                dest, key_strs, "READ", self.read_contexts, self.read_executor
+            )
 
         return [True] * len(key_strs) if success else [False] * len(key_strs)
 
@@ -631,9 +722,13 @@ class HiCacheNixl(HiCacheStorage):
                     )
                     return [False] * len(keys)
                 file_paths.append(file_path)
-            success = self._execute_transfer(src, file_paths, "WRITE", self.write_ctx)
+            success = self._execute_transfer_parallel(
+                src, file_paths, "WRITE", self.write_contexts, self.write_executor
+            )
         else:  # mem_type == "OBJ"
-            success = self._execute_transfer(src, key_strs, "WRITE", self.write_ctx)
+            success = self._execute_transfer_parallel(
+                src, key_strs, "WRITE", self.write_contexts, self.write_executor
+            )
 
         return [True] * len(keys) if success else [False] * len(keys)
 
@@ -671,3 +766,7 @@ class HiCacheNixl(HiCacheStorage):
         )
 
         return results_set
+
+    def close(self) -> None:
+        self.read_executor.shutdown(wait=True)
+        self.write_executor.shutdown(wait=True)
