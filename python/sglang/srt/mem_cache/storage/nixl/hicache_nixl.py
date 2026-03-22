@@ -1,7 +1,7 @@
 import logging
-import threading
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, List, Optional, Union
 
 import torch
@@ -31,6 +31,15 @@ except ImportError as e:
     ) from e
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _NixlAgentContext:
+    role: str
+    agent_name: str
+    agent: Any
+    registration: NixlRegistration
+    backend_selector: NixlBackendSelection
 
 
 class HiCacheNixl(HiCacheStorage):
@@ -75,28 +84,61 @@ class HiCacheNixl(HiCacheStorage):
             self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
 
         agent_config = nixl_agent_config(backends=[])
-        self.agent_name = f"hicache_nixl_{str(uuid.uuid4())}"
-        self.agent = nixl_agent(self.agent_name, agent_config)
+        self._agent_config = agent_config
+        self._nixlconfig = nixlconfig
+        self._plugin = plugin
 
-        self.backend_selector = NixlBackendSelection(plugin, nixlconfig)
-        if not self.backend_selector.create_backend(self.agent):
-            raise RuntimeError("Failed to create NIXL backend")
+        self.query_ctx = self._create_agent_context("query")
+        self.backend_selector = self.query_ctx.backend_selector
+        self.read_ctx = self._create_agent_context("read")
+        self.write_ctx = self._create_agent_context("write")
 
-        self.registration = NixlRegistration(self.agent)
-        self._agent_lock = threading.Lock()
+        self.agent_name = self.read_ctx.agent_name
+        self.agent = self.read_ctx.agent
+        self.registration = self.read_ctx.registration
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
+    def _create_agent_context(self, role: str) -> _NixlAgentContext:
+        agent_name = f"hicache_nixl_{role}_{uuid.uuid4()}"
+        agent = nixl_agent(agent_name, self._agent_config)
+        backend_selector = NixlBackendSelection(self._plugin, self._nixlconfig)
+        if not backend_selector.create_backend(agent):
+            raise RuntimeError(f"Failed to create NIXL backend for {role} agent")
+
+        if hasattr(self, "backend_selector"):
+            if backend_selector.backend_name != self.backend_selector.backend_name:
+                raise RuntimeError(
+                    "NIXL backend mismatch across agents: "
+                    f"{backend_selector.backend_name} != {self.backend_selector.backend_name}"
+                )
+            if backend_selector.mem_type != self.backend_selector.mem_type:
+                raise RuntimeError(
+                    "NIXL memory type mismatch across agents: "
+                    f"{backend_selector.mem_type} != {self.backend_selector.mem_type}"
+                )
+
+        return _NixlAgentContext(
+            role=role,
+            agent_name=agent_name,
+            agent=agent,
+            registration=NixlRegistration(agent),
+            backend_selector=backend_selector,
+        )
+
     def register_buffers(
-        self, buffers: Union[torch.Tensor, List[torch.Tensor], List[tuple]]
+        self,
+        buffers: Union[torch.Tensor, List[torch.Tensor], List[tuple]],
+        ctx: Optional[_NixlAgentContext] = None,
     ) -> Optional[Any]:
         """Register tensor(s) or target locations in host memory (list of addr,len tuples) with NIXL."""
+        registration = (ctx or self.read_ctx).registration
         if isinstance(buffers[0], tuple):
             tuples = [(x[0], x[1], 0, "") for x in buffers]
-            return self.registration._register_memory(tuples, "DRAM")
+            return registration._register_memory(tuples, "DRAM")
         else:
-            return self.registration._register_memory(buffers)
+            return registration._register_memory(buffers)
 
     def register_files(
         self, file_paths: List[str], open_file: Optional[bool] = True
@@ -104,7 +146,7 @@ class HiCacheNixl(HiCacheStorage):
         """Register files with NIXL."""
         tuples = self.file_manager.files_to_nixl_tuples(file_paths)
         try:
-            return self.registration._register_memory(tuples, "FILE")
+            return self.read_ctx.registration._register_memory(tuples, "FILE")
         finally:
             self.file_manager.close_nixl_tuples(tuples)
 
@@ -115,13 +157,14 @@ class HiCacheNixl(HiCacheStorage):
         if not keys:
             return None
         tuples = [(0, 0, key, "") for key in keys]
-        return self.registration._register_memory(tuples, "OBJ")
+        return self.read_ctx.registration._register_memory(tuples, "OBJ")
 
     def _execute_transfer(
         self,
         buffers: Optional[List[torch.Tensor | tuple]],
         keys: List[str],
         direction: str,
+        ctx: _NixlAgentContext,
     ) -> bool:
         if len(buffers) != len(keys):
             logger.error("Mismatch between number of tensors/buffers and files/objects")
@@ -132,101 +175,87 @@ class HiCacheNixl(HiCacheStorage):
         tuples = []
 
         try:
-            with self._agent_lock:
-                if self.backend_selector.mem_type == "FILE":
-                    tuples = self.file_manager.files_to_nixl_tuples(keys)
-                    if not tuples or not self.registration._register_memory(
-                        tuples, "FILE"
-                    ):
-                        logger.error("Failed to prepare files for transfer")
-                        return False
-                else:  # mem_type == "OBJ"
-                    tuples = [(0, 0, key, "") for key in keys]
-                    if not tuples or not self.registration._register_memory(
-                        tuples, "OBJ"
-                    ):
-                        logger.error("Failed to register objects")
-                        return False
-
-                # Prepare transfer descriptors
-                if isinstance(buffers[0], torch.Tensor):
-                    tensor_sizes = [
-                        tensor.element_size() * tensor.numel() for tensor in buffers
-                    ]
-                    storage_tuples = [
-                        (x[0], s, x[2]) for x, s in zip(tuples, tensor_sizes)
-                    ]
-                    host_descs = self.agent.get_xfer_descs(buffers)
-
-                    if direction in ("READ", "WRITE"):
-                        self.register_buffers(buffers)
-
-                elif isinstance(buffers[0], tuple):
-                    storage_tuples = [
-                        (x[0], y[1], x[2]) for x, y in zip(tuples, buffers)
-                    ]
-                    host_descs = self.agent.get_xfer_descs(
-                        [(x[0], x[1], 0) for x in buffers], "DRAM"
-                    )
-
-                    if direction in ("READ", "WRITE"):
-                        self.register_buffers(buffers)
-
-                else:
+            if ctx.backend_selector.mem_type == "FILE":
+                tuples = self.file_manager.files_to_nixl_tuples(keys)
+                if not tuples or not ctx.registration._register_memory(tuples, "FILE"):
+                    logger.error("Failed to prepare files for transfer")
+                    return False
+            else:  # mem_type == "OBJ"
+                tuples = [(0, 0, key, "") for key in keys]
+                if not tuples or not ctx.registration._register_memory(tuples, "OBJ"):
+                    logger.error("Failed to register objects")
                     return False
 
-                storage_descs = self.agent.get_xfer_descs(
-                    storage_tuples, self.backend_selector.mem_type
+            # Prepare transfer descriptors
+            if isinstance(buffers[0], torch.Tensor):
+                tensor_sizes = [
+                    tensor.element_size() * tensor.numel() for tensor in buffers
+                ]
+                storage_tuples = [(x[0], s, x[2]) for x, s in zip(tuples, tensor_sizes)]
+                host_descs = ctx.agent.get_xfer_descs(buffers)
+
+                if direction in ("READ", "WRITE"):
+                    self.register_buffers(buffers, ctx=ctx)
+
+            elif isinstance(buffers[0], tuple):
+                storage_tuples = [(x[0], y[1], x[2]) for x, y in zip(tuples, buffers)]
+                host_descs = ctx.agent.get_xfer_descs(
+                    [(x[0], x[1], 0) for x in buffers], "DRAM"
                 )
 
-                if (host_descs is None) or (storage_descs is None):
-                    logger.error("Failed to get transfer descriptors")
+                if direction in ("READ", "WRITE"):
+                    self.register_buffers(buffers, ctx=ctx)
+
+            else:
+                return False
+
+            storage_descs = ctx.agent.get_xfer_descs(
+                storage_tuples, ctx.backend_selector.mem_type
+            )
+
+            if (host_descs is None) or (storage_descs is None):
+                logger.error("Failed to get transfer descriptors")
+                return False
+
+            try:
+                xfer_req = ctx.agent.initialize_xfer(
+                    direction, host_descs, storage_descs, ctx.agent_name
+                )
+            except Exception:
+                if not self.register_buffers(buffers, ctx=ctx):
+                    logger.error("Failed to register tensors/buffers")
                     return False
 
                 try:
-                    xfer_req = self.agent.initialize_xfer(
-                        direction, host_descs, storage_descs, self.agent_name
+                    xfer_req = ctx.agent.initialize_xfer(
+                        direction, host_descs, storage_descs, ctx.agent_name
                     )
-                except Exception:
-                    if not self.register_buffers(buffers):
-                        logger.error("Failed to register tensors/buffers")
-                        return False
-
-                    try:
-                        xfer_req = self.agent.initialize_xfer(
-                            direction, host_descs, storage_descs, self.agent_name
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to create transfer request: {e}")
-                        return False
-
-                try:
-                    state = self.agent.transfer(xfer_req)
-                    while state != "DONE":
-                        state = self.agent.check_xfer_state(xfer_req)
-                        if state == "ERR":
-                            self.agent.release_xfer_handle(xfer_req)
-                            logger.error("Transfer failed")
-                            return False
-                        time.sleep(0.0001)
-
-                    self.agent.release_xfer_handle(xfer_req)
-                    return True
-
                 except Exception as e:
-                    logger.error(f"Failed to execute transfer: {e}")
-                    import traceback
-
-                    logger.error(f"Traceback: {traceback.format_exc()}")
+                    logger.error(f"Failed to create transfer request: {e}")
                     return False
-        finally:
-            if self.backend_selector.mem_type == "FILE":
-                start_time = time.perf_counter()
-                self.file_manager.close_nixl_tuples(tuples)
-                end_time = time.perf_counter()
-                elapsed_time_ms = (end_time - start_time) * 1000
-                logger.debug(f"NIXL _execute_transfer: close files {len(tuples)=}, {elapsed_time_ms=}")
 
+            try:
+                state = ctx.agent.transfer(xfer_req)
+                while state != "DONE":
+                    state = ctx.agent.check_xfer_state(xfer_req)
+                    if state == "ERR":
+                        ctx.agent.release_xfer_handle(xfer_req)
+                        logger.error("Transfer failed")
+                        return False
+                    time.sleep(0.0001)
+
+                ctx.agent.release_xfer_handle(xfer_req)
+                return True
+
+            except Exception as e:
+                logger.error(f"Failed to execute transfer: {e}")
+                import traceback
+
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                return False
+        finally:
+            if ctx.backend_selector.mem_type == "FILE":
+                self.file_manager.close_nixl_tuples(tuples)
 
     def get(
         self,
@@ -270,9 +299,9 @@ class HiCacheNixl(HiCacheStorage):
 
         if self.backend_selector.mem_type == "FILE":
             file_paths = [self.file_manager.get_file_path(key) for key in suffixed_keys]
-            success = self._execute_transfer(dest, file_paths, "READ")
+            success = self._execute_transfer(dest, file_paths, "READ", self.read_ctx)
         else:
-            success = self._execute_transfer(dest, suffixed_keys, "READ")
+            success = self._execute_transfer(dest, suffixed_keys, "READ", self.read_ctx)
         return target_locations if success and not target_sizes else [None] * len(keys)
 
     def set(
@@ -313,9 +342,11 @@ class HiCacheNixl(HiCacheStorage):
                     logger.error(f"Failed to create file {file_path}")
                     return False
                 file_paths.append(file_path)
-            return self._execute_transfer(values, file_paths, "WRITE")
+            return self._execute_transfer(values, file_paths, "WRITE", self.write_ctx)
         else:  # mem_type == "OBJ"
-            return self._execute_transfer(values, suffixed_keys, "WRITE")
+            return self._execute_transfer(
+                values, suffixed_keys, "WRITE", self.write_ctx
+            )
 
     ############################################################################
     # batch_*_v1 functions
@@ -361,16 +392,16 @@ class HiCacheNixl(HiCacheStorage):
         # obtain list of tuples by calling self.registration.create_query_tuples()
         tuples = []
         for key in key_list:
-            tuples += self.registration.create_query_tuples(
+            tuples += self.query_ctx.registration.create_query_tuples(
                 key,
-                self.backend_selector.mem_type,
+                self.query_ctx.backend_selector.mem_type,
                 self.file_manager if self.backend_selector.mem_type == "FILE" else None,
             )
 
-        query_res = self.agent.query_memory(
+        query_res = self.query_ctx.agent.query_memory(
             tuples,
-            self.backend_selector.backend_name,
-            mem_type=self.backend_selector.mem_type,
+            self.query_ctx.backend_selector.backend_name,
+            mem_type=self.query_ctx.backend_selector.mem_type,
         )
 
         for i in range(len(query_res)):
@@ -464,9 +495,9 @@ class HiCacheNixl(HiCacheStorage):
 
         if self.backend_selector.mem_type == "FILE":
             file_paths = [self.file_manager.get_file_path(key) for key in key_strs]
-            success = self._execute_transfer(dest, file_paths, "READ")
+            success = self._execute_transfer(dest, file_paths, "READ", self.read_ctx)
         else:
-            success = self._execute_transfer(dest, key_strs, "READ")
+            success = self._execute_transfer(dest, key_strs, "READ", self.read_ctx)
 
         return [True] * len(key_strs) if success else [False] * len(key_strs)
 
@@ -600,9 +631,9 @@ class HiCacheNixl(HiCacheStorage):
                     )
                     return [False] * len(keys)
                 file_paths.append(file_path)
-            success = self._execute_transfer(src, file_paths, "WRITE")
+            success = self._execute_transfer(src, file_paths, "WRITE", self.write_ctx)
         else:  # mem_type == "OBJ"
-            success = self._execute_transfer(src, key_strs, "WRITE")
+            success = self._execute_transfer(src, key_strs, "WRITE", self.write_ctx)
 
         return [True] * len(keys) if success else [False] * len(keys)
 
