@@ -347,7 +347,7 @@ class HiCacheNixl(HiCacheStorage):
         if self.is_zero_copy:
             key_list = self._get_key_list_from_meta(keys)
             key_denominator = (
-                1 if not self.is_mla_model else 2
+                1 if self.is_mla_model else 2
             )  # MLA model only has k buffer, no separate v buffer
         else:
             key_list = [self._get_suffixed_key(key) for key in keys]
