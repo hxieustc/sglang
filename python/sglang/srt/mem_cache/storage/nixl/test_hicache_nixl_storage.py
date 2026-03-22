@@ -3,7 +3,7 @@
 import os
 import unittest
 from typing import List
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("FLASHINFER_WORKSPACE_BASE", "/tmp")
 
@@ -56,6 +56,9 @@ class TestNixlUnified(unittest.TestCase):
 
     def tearDown(self):
         """Clean up test directories."""
+        if hasattr(self, "hicache"):
+            self.hicache.close()
+        self.file_manager.close_all_files()
         if os.path.exists(self.test_dir):
             import shutil
 
@@ -230,7 +233,7 @@ class TestNixlUnified(unittest.TestCase):
         tuples = self.file_manager.files_to_nixl_tuples([test_file])
         self.assertIsNotNone(tuples)
         self.assertTrue(len(tuples) > 0)
-        self.file_manager.close_nixl_tuples(tuples)
+        self.file_manager.release_nixl_tuples(tuples)
 
     def test_error_handling(self):
         """Test error handling in file operations."""
@@ -254,8 +257,8 @@ class TestNixlUnified(unittest.TestCase):
         tensors = [torch.randn(5, 5) for _ in range(3)]
         self.assertIsNotNone(self.hicache.register_buffers(tensors))
 
-    def test_register_files_closes_file_descriptors(self):
-        """Test that register_files closes all opened file descriptors."""
+    def test_register_files_reuses_cached_file_descriptors(self):
+        """Test that register_files keeps descriptors cached for reuse."""
         files = [os.path.join(self.test_dir, f"fd_test_file_{i}.bin") for i in range(3)]
         for file in files:
             self.file_manager.create_file(file)
@@ -275,8 +278,22 @@ class TestNixlUnified(unittest.TestCase):
         self.assertEqual(len(captured_fds), len(files))
 
         for fd in captured_fds:
-            with self.assertRaises(OSError):
-                os.fstat(fd)
+            os.fstat(fd)
+
+    def test_close_releases_cached_file_descriptors(self):
+        """Test that backend close releases cached file descriptors."""
+        test_file = os.path.join(self.test_dir, "cached_fd.bin")
+        self.hicache.file_manager.create_file(test_file)
+
+        tuples = self.hicache.file_manager.files_to_nixl_tuples([test_file])
+        fd = tuples[0][2]
+        self.hicache.file_manager.release_nixl_tuples(tuples)
+
+        os.fstat(fd)
+        self.hicache.close()
+
+        with self.assertRaises(OSError):
+            os.fstat(fd)
 
     def test_register_files_with_tuples(self):
         """Test registration of files using file paths."""
@@ -285,6 +302,28 @@ class TestNixlUnified(unittest.TestCase):
             self.file_manager.create_file(file)
 
         self.assertIsNotNone(self.hicache.register_files(files))
+
+    def test_batch_exists_zero_copy_mla_uses_single_key_denominator(self):
+        """Zero-copy MLA should count one storage key per logical page."""
+        self.hicache.is_zero_copy = True
+        self.hicache.is_mla_model = True
+
+        with patch.object(
+            self.hicache.agent, "query_memory", return_value=[object(), None]
+        ):
+            self.assertEqual(self.hicache.batch_exists(["key1", "key2"]), 1)
+
+    def test_batch_exists_zero_copy_mha_uses_two_key_denominator(self):
+        """Zero-copy MHA should count k/v storage keys per logical page."""
+        self.hicache.is_zero_copy = True
+        self.hicache.is_mla_model = False
+
+        with patch.object(
+            self.hicache.agent,
+            "query_memory",
+            return_value=[object(), object(), None, None],
+        ):
+            self.assertEqual(self.hicache.batch_exists(["key1", "key2"]), 1)
 
 
 if __name__ == "__main__":

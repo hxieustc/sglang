@@ -104,7 +104,7 @@ class HiCacheNixl(HiCacheStorage):
         try:
             return self.registration._register_memory(tuples, "FILE")
         finally:
-            self.file_manager.close_nixl_tuples(tuples)
+            self.file_manager.release_nixl_tuples(tuples)
 
     def register_objects(
         self, keys: List[str], sizes: Optional[List[int]] = None
@@ -217,7 +217,7 @@ class HiCacheNixl(HiCacheStorage):
                 return False
         finally:
             if self.backend_selector.mem_type == "FILE":
-                self.file_manager.close_nixl_tuples(tuples)
+                self.file_manager.release_nixl_tuples(tuples)
 
     def get(
         self,
@@ -316,6 +316,10 @@ class HiCacheNixl(HiCacheStorage):
     def clear(self) -> None:
         self.file_manager.clear()
 
+    def close(self) -> None:
+        if self.file_manager is not None:
+            self.file_manager.close_all_files()
+
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
 
@@ -343,7 +347,7 @@ class HiCacheNixl(HiCacheStorage):
         if self.is_zero_copy:
             key_list = self._get_key_list_from_meta(keys)
             key_denominator = (
-                1 if not self.is_mla_model else 2
+                1 if self.is_mla_model else 2
             )  # MLA model only has k buffer, no separate v buffer
         else:
             key_list = [self._get_suffixed_key(key) for key in keys]
