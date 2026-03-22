@@ -29,6 +29,8 @@ The main storage connector that provides:
 - Single and batch tensor set/get operations
 - Automatic backend selection (3FS > POSIX > GDS_MT > GDS > OBJ)
 - High-performance file-based (or) object based storage access using NIXL
+- Dedicated NIXL query agent plus pooled read/write agents for concurrent controller threads
+- HF3FS-style throughput scaling for transfer-heavy get/set paths via `numjobs`
 
 ### NixlUtils
 Consolidated utility classes:
@@ -36,6 +38,34 @@ Consolidated utility classes:
 - **NixlBackendConfig** - Handles backend configuration
 - **NixlRegistration** - Manages memory registration for tensors, files and objects
 - **NixlFileManager** - Handles file system operations and NIXL tuple creation
+
+## Design Notes
+
+### Why NIXL Uses Multiple Agents
+
+HiCache drives storage work from multiple controller threads:
+
+- prefetch hit queries call `batch_exists()`
+- prefetch I/O calls `batch_get_v1()`
+- backup/writeback calls `batch_set_v1()`
+
+The NIXL backend now mirrors the concurrency philosophy used by HF3FS:
+
+- one dedicated **query agent** handles `query_memory()`
+- a pool of **read agents** handles transfer-heavy get paths
+- a pool of **write agents** handles transfer-heavy set paths
+
+This avoids sharing a single NIXL native agent across unrelated controller threads, while still allowing throughput scaling for larger transfer batches.
+
+### Throughput Scaling with `numjobs`
+
+Read and write transfers are chunked and fanned out across multiple NIXL agents using a thread pool, similar to how HF3FS distributes work across multiple clients.
+
+- `numjobs` controls the size of the read/write agent pools
+- default `numjobs` is **4**
+- `numjobs` is a **runtime-only** HiCache/NIXL setting and is **not** forwarded to NIXL plugin backend initialization
+
+This design keeps backend plugin init params clean while allowing transfer parallelism to be tuned independently.
 
 ## Using NIXL as the HiCache Storage Backend
 
@@ -53,6 +83,8 @@ The NIXL backend can support **multiple storage plugins** (e.g., POSIX, GDS, GDS
 * NIXL selects the backend based on **internal priority and availability**, if neither a config file nor an in-command-line config string is provided.
 
 If a plugin is configured but its dependencies are missing, it will be skipped.
+
+Runtime-only knobs such as transfer pool sizing are configured alongside backend settings, but are consumed by HiCache rather than passed through to NIXL backend creation.
 
 
 ### 2. Setting the Storage Directory (Optional)
@@ -115,6 +147,17 @@ python3 -m sglang.launch_server \
 
 The structure of the config file is described in further details in [Configuration File Spec](#Configuration-File-Specification).
 
+Example TOML snippet showing both backend config and runtime transfer scaling:
+
+```toml
+[runtime]
+numjobs = 4
+
+[plugin.posix]
+active = true
+use_uring = true
+```
+
 
 #### 3. Using Command-line JSON String
 
@@ -125,7 +168,7 @@ This requires explicitly specifying the plugin type via an environment variable,
 The below example shows how to use command-line string to use the POSIX plugin where URING is enabled for async POSIX storage.
 
 ```bash
-export SGLANG_HICACHE_NIXL_BACKEND_PLUGIN_TYPE=POSIX
+export SGLANG_HICACHE_NIXL_BACKEND_PLUGIN=POSIX
 
 python3 -m sglang.launch_server \
   --model-path <model> \
@@ -137,7 +180,7 @@ python3 -m sglang.launch_server \
   --hicache-size 64 \
   --hicache-write-policy write_through \
   --hicache-storage-backend nixl \
-  --hicache-storage-backend-extra-config "{'use_uring': 'true'}"
+  --hicache-storage-backend-extra-config "{'use_uring': 'true', 'numjobs': 4}"
 ```
 
 ⚠️ **Note**:
@@ -156,22 +199,18 @@ From the current directory run:
 
 #### Run all NIXL tests:
 ```bash
-PYTHONPATH=. python -m pytest test_hicache_nixl_storage.py -o asyncio_mode=strict
+FLASHINFER_WORKSPACE_BASE=/tmp PYTHONPATH=. python -m unittest test_hicache_nixl_storage.py
 ```
 
 #### Run with verbose output:
 ```bash
-PYTHONPATH=. python -m pytest test_hicache_nixl_storage.py -v -o asyncio_mode=strict
+FLASHINFER_WORKSPACE_BASE=/tmp PYTHONPATH=. python -m unittest -v test_hicache_nixl_storage.py
 ```
-
-Note: The `-v` flag provides more detailed output, showing each test case name and its result.
 
 #### Run a specific test:
 ```bash
-PYTHONPATH=. python -m pytest test_hicache_nixl_storage.py -v -k test_single_set_get -o asyncio_mode=strict
+FLASHINFER_WORKSPACE_BASE=/tmp PYTHONPATH=. python -m unittest -v test_hicache_nixl_storage.TestNixlUnified.test_single_set_get
 ```
-
-Note: The `-o asyncio_mode=strict` flag is added to suppress warnings about asyncio configuration. This is not required for test functionality but provides cleaner output.
 
 ## Test Coverage
 
@@ -191,6 +230,11 @@ Tests for this integration, a test suite can be found at `test_hicache_nixl_stor
 ### Registration Tests (2 tests)
 - Tensor registration with memory type detection
 - File registration using NIXL tuples
+
+### Runtime / Concurrency Tests (3 tests)
+- Runtime-only config filtering for backend init params
+- Default `numjobs=4` agent-pool creation
+- Runtime override of `numjobs`
 
 ## Expected Output
 
@@ -214,6 +258,12 @@ If NIXL operations fail:
 - Verify that required plugins are available
 - Ensure file permissions are correct for test directories
 
+### Throughput Tuning
+If transfer throughput is lower than expected:
+- Check the effective `numjobs` value in `extra_config`
+- Increase `numjobs` only when the backend and filesystem can sustain parallel transfer work
+- For single-threaded or very small batch workloads, larger `numjobs` may add overhead rather than improve throughput
+
 ## File Structure
 
 ```
@@ -221,8 +271,7 @@ python/sglang/srt/mem_cache/nixl/
 ├── hicache_nixl.py          # Main HiCache storage connector
 ├── nixl_utils.py            # All NIXL utility classes
 ├── README.md                # This file
-└── tests/
-    └── test_nixl_unified.py # All tests in one file
+└── test_hicache_nixl_storage.py
 ```
 
 ## Dependencies

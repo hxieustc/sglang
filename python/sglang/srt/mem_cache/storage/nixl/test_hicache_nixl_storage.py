@@ -12,6 +12,7 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig
 from sglang.srt.mem_cache.storage.nixl.hicache_nixl import HiCacheNixl
 from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
+    NixlBackendConfig,
     NixlFileManager,
     NixlRegistration,
 )
@@ -56,6 +57,8 @@ class TestNixlUnified(unittest.TestCase):
 
     def tearDown(self):
         """Clean up test directories."""
+        if hasattr(self, "hicache") and hasattr(self.hicache, "close"):
+            self.hicache.close()
         if os.path.exists(self.test_dir):
             import shutil
 
@@ -285,6 +288,55 @@ class TestNixlUnified(unittest.TestCase):
             self.file_manager.create_file(file)
 
         self.assertIsNotNone(self.hicache.register_files(files))
+
+    def test_runtime_only_params_are_not_passed_to_backend_init(self):
+        """Runtime params should stay in HiCache and not leak into NIXL backend init."""
+        config = NixlBackendConfig(
+            {
+                "numjobs": 8,
+                "runtime": {"numjobs": 6},
+                "plugin": {"posix": {"active": True, "use_uring": True}},
+            }
+        )
+
+        initparams = config.get_backend_initparams("POSIX")
+
+        self.assertEqual(initparams["active"], "True")
+        self.assertEqual(initparams["use_uring"], "True")
+        self.assertNotIn("numjobs", initparams)
+        self.assertNotIn("runtime", initparams)
+        self.assertEqual(config.get_runtime_param("numjobs", 4), 6)
+
+    def test_hicache_default_numjobs_creates_agent_pools(self):
+        """HiCacheNixl should default to four transfer agents per direction."""
+        self.assertEqual(self.hicache.num_jobs, 4)
+        self.assertEqual(len(self.hicache.read_contexts), 4)
+        self.assertEqual(len(self.hicache.write_contexts), 4)
+
+    def test_hicache_runtime_numjobs_override(self):
+        """Runtime numjobs override should control the transfer pool size."""
+        storage_config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=2,
+            pp_rank=0,
+            pp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name="test_model",
+            extra_config={
+                "runtime": {"numjobs": 2},
+                "plugin": {"posix": {"active": True}},
+            },
+        )
+
+        hicache = HiCacheNixl(storage_config=storage_config)
+        try:
+            self.assertEqual(hicache.num_jobs, 2)
+            self.assertEqual(len(hicache.read_contexts), 2)
+            self.assertEqual(len(hicache.write_contexts), 2)
+        finally:
+            hicache.close()
 
 
 if __name__ == "__main__":
