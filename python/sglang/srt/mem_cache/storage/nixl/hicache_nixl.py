@@ -101,9 +101,16 @@ class HiCacheNixl(HiCacheStorage):
     ) -> Optional[Any]:
         """Register files with NIXL."""
         tuples = self.file_manager.files_to_nixl_tuples(file_paths)
+        registered_memory = None
         try:
-            return self.registration._register_memory(tuples, "FILE")
+            registered_memory = self.registration._register_memory(tuples, "FILE")
+            return registered_memory
         finally:
+            if registered_memory is not None:
+                try:
+                    self.agent.deregister_memory(registered_memory)
+                except Exception as e:
+                    logger.error(f"Failed to deregister file memory: {e}")
             self.file_manager.close_nixl_tuples(tuples)
 
     def register_objects(
@@ -128,11 +135,13 @@ class HiCacheNixl(HiCacheStorage):
         # Registering file and object keys per transfer, to be updated when
         # pre-registration for file and object is added to HiCache.
         tuples = []
+        registered_memory = None
 
         try:
             if self.backend_selector.mem_type == "FILE":
                 tuples = self.file_manager.files_to_nixl_tuples(keys)
-                if not tuples or not self.registration._register_memory(tuples, "FILE"):
+                registered_memory = self.registration._register_memory(tuples, "FILE")
+                if not tuples or not registered_memory:
                     logger.error("Failed to prepare files for transfer")
                     return False
             else:  # mem_type == "OBJ"
@@ -217,6 +226,11 @@ class HiCacheNixl(HiCacheStorage):
                 return False
         finally:
             if self.backend_selector.mem_type == "FILE":
+                if registered_memory is not None:
+                    try:
+                        self.agent.deregister_memory(registered_memory)
+                    except Exception as e:
+                        logger.error(f"Failed to deregister file memory: {e}")
                 self.file_manager.close_nixl_tuples(tuples)
 
     def get(
