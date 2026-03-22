@@ -231,7 +231,12 @@ class HiCacheNixl(HiCacheStorage):
                         self.agent.deregister_memory(registered_memory)
                     except Exception as e:
                         logger.error(f"Failed to deregister file memory: {e}")
+
+                start_time = time.perf_counter()
                 self.file_manager.close_nixl_tuples(tuples)
+                end_time = time.perf_counter()
+                elapsed_time_ms = (end_time - start_time) * 1000
+                logger.debug(f"NIXL _execute_transfer: close files {len(tuples)=}, {elapsed_time_ms=}")
 
     def get(
         self,
