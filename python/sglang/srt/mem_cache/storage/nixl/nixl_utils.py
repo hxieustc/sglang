@@ -1,5 +1,6 @@
 import logging
 import os
+import resource
 import threading
 from collections import OrderedDict
 from typing import Any, List, Optional, Tuple, Union
@@ -223,7 +224,7 @@ class NixlRegistration:
 class NixlFileManager:
     """Handles file system operations for NIXL."""
 
-    def __init__(self, base_dir: str, max_open_files: int = 256):
+    def __init__(self, base_dir: str, max_open_files: Optional[int] = None):
         """
         Initialize file manager.
         Args:
@@ -231,7 +232,11 @@ class NixlFileManager:
             max_open_files: Maximum number of cached file descriptors to retain
         """
         self.base_dir = base_dir
-        self.max_open_files = max_open_files
+        self.max_open_files = (
+            max_open_files
+            if max_open_files is not None
+            else self._get_default_max_open_files()
+        )
         self._fd_cache: OrderedDict[str, int] = OrderedDict()
         self._fd_refcounts: dict[str, int] = {}
         self._lock = threading.Lock()
@@ -240,6 +245,18 @@ class NixlFileManager:
         else:
             os.makedirs(base_dir, exist_ok=True)
             logger.debug(f"Initialized file manager with base directory: {base_dir}")
+
+    @staticmethod
+    def _get_default_max_open_files() -> int:
+        try:
+            soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        except (OSError, ValueError):
+            return 1_000_000
+
+        if soft_limit in (-1, resource.RLIM_INFINITY):
+            return 1_000_000
+
+        return max(1, min(1_000_000, int(soft_limit)))
 
     def clear(self) -> None:
         """Clear all files in the base directory."""
@@ -278,9 +295,7 @@ class NixlFileManager:
         """Open a file (or reuse a cached descriptor) and return its file descriptor."""
         with self._lock:
             if file_path in self._fd_cache:
-                fd = self._fd_cache[file_path]
-                self._fd_cache.move_to_end(file_path)
-                return fd
+                return self._fd_cache[file_path]
 
         try:
             fd = os.open(file_path, os.O_RDWR)
@@ -291,7 +306,6 @@ class NixlFileManager:
         with self._lock:
             cached_fd = self._fd_cache.get(file_path)
             if cached_fd is not None:
-                self._fd_cache.move_to_end(file_path)
                 try:
                     os.close(fd)
                 except OSError:
@@ -333,7 +347,6 @@ class NixlFileManager:
                 return
             if self._fd_refcounts[file_path] > 0:
                 self._fd_refcounts[file_path] -= 1
-            self._evict_idle_fds_locked()
 
     def _evict_idle_fds_locked(self) -> None:
         while len(self._fd_cache) > self.max_open_files:
