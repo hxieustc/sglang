@@ -365,6 +365,71 @@ class HiCacheNixl(HiCacheStorage):
                 page_versions, owner_by_page, storage_keys_by_page
             )
 
+    def _group_file_write_items(
+        self,
+        page_keys: List[str],
+        storage_keys: List[str],
+        buffers: List[torch.Tensor | tuple],
+    ) -> Optional[Dict[int, Dict[str, Any]]]:
+        owned_items = self._collect_local_owned_write_items(
+            page_keys, storage_keys, buffers
+        )
+        if not owned_items:
+            return {}
+
+        owned_page_keys = [item[0] for item in owned_items]
+        owned_storage_keys = [item[1] for item in owned_items]
+        owned_buffers = [item[2] for item in owned_items]
+        prepared = self._prepare_versioned_write_file_paths(
+            owned_page_keys, owned_storage_keys
+        )
+        if prepared is None:
+            return None
+
+        grouped: Dict[int, Dict[str, Any]] = {}
+        for page_key, storage_key, buffer, file_path in zip(
+            owned_page_keys,
+            owned_storage_keys,
+            owned_buffers,
+            prepared["file_paths"],
+        ):
+            idx = 0
+            group = grouped.setdefault(
+                idx,
+                {
+                    "buffers": [],
+                    "file_paths": [],
+                    "page_versions": {},
+                    "owner_by_page": {},
+                    "storage_keys_by_page": {},
+                },
+            )
+            group["buffers"].append(buffer)
+            group["file_paths"].append(file_path)
+            group["page_versions"][page_key] = prepared["page_versions"][page_key]
+            group["owner_by_page"][page_key] = self.tp_rank
+            group["storage_keys_by_page"].setdefault(page_key, []).append(storage_key)
+
+        return grouped
+
+    def _submit_file_write_groups(self, grouped: Dict[int, Dict[str, Any]]) -> bool:
+        if not grouped:
+            return True
+
+        futures = [
+            self.write_executor.submit(
+                self._execute_file_write_group,
+                group["buffers"],
+                group["file_paths"],
+                group["page_versions"],
+                group["owner_by_page"],
+                group["storage_keys_by_page"],
+                self.write_contexts[idx],
+            )
+            for idx, group in grouped.items()
+        ]
+        return all(future.result() for future in futures)
+
     def _drain_pending_gc(self) -> None:
         if not self._pending_gc or self.file_gc_grace_seconds < 0:
             return
@@ -716,59 +781,11 @@ class HiCacheNixl(HiCacheStorage):
 
         if self.backend_selector.mem_type == "FILE":
             page_keys = [self._get_page_key(key) for key in keys]
-            owned_items = self._collect_local_owned_write_items(
-                page_keys, suffixed_keys, values
-            )
-            if not owned_items:
-                return True
-            owned_page_keys = [item[0] for item in owned_items]
-            owned_storage_keys = [item[1] for item in owned_items]
-            owned_buffers = [item[2] for item in owned_items]
-            prepared = self._prepare_versioned_write_file_paths(
-                owned_page_keys, owned_storage_keys
-            )
-            if prepared is None:
+            grouped = self._group_file_write_items(page_keys, suffixed_keys, values)
+            if grouped is None:
                 logger.error("Failed to prepare files for write")
                 return False
-            grouped: Dict[int, Dict[str, Any]] = {}
-            for page_key, storage_key, value, file_path in zip(
-                owned_page_keys,
-                owned_storage_keys,
-                owned_buffers,
-                prepared["file_paths"],
-            ):
-                idx = 0
-                group = grouped.setdefault(
-                    idx,
-                    {
-                        "buffers": [],
-                        "file_paths": [],
-                        "page_versions": {},
-                        "owner_by_page": {},
-                        "storage_keys_by_page": {},
-                    },
-                )
-                group["buffers"].append(value)
-                group["file_paths"].append(file_path)
-                group["page_versions"][page_key] = prepared["page_versions"][page_key]
-                group["owner_by_page"][page_key] = self.tp_rank
-                group["storage_keys_by_page"].setdefault(page_key, []).append(
-                    storage_key
-                )
-
-            futures = [
-                self.write_executor.submit(
-                    self._execute_file_write_group,
-                    group["buffers"],
-                    group["file_paths"],
-                    group["page_versions"],
-                    group["owner_by_page"],
-                    group["storage_keys_by_page"],
-                    self.write_contexts[idx],
-                )
-                for idx, group in grouped.items()
-            ]
-            return all(future.result() for future in futures)
+            return self._submit_file_write_groups(grouped)
         else:  # mem_type == "OBJ"
             return self._execute_transfer_parallel(
                 values,
@@ -1078,59 +1095,11 @@ class HiCacheNixl(HiCacheStorage):
 
         if self.backend_selector.mem_type == "FILE":
             page_keys = self._expand_page_keys(keys)
-            owned_items = self._collect_local_owned_write_items(
-                page_keys, key_strs, src
-            )
-            if not owned_items:
-                return [True] * len(keys)
-            owned_page_keys = [item[0] for item in owned_items]
-            owned_storage_keys = [item[1] for item in owned_items]
-            owned_buffers = [item[2] for item in owned_items]
-            prepared = self._prepare_versioned_write_file_paths(
-                owned_page_keys, owned_storage_keys
-            )
-            if prepared is None:
+            grouped = self._group_file_write_items(page_keys, key_strs, src)
+            if grouped is None:
                 logger.error("Failed to prepare files for transfer")
                 return [False] * len(keys)
-            grouped: Dict[int, Dict[str, Any]] = {}
-            for page_key, storage_key, buffer, file_path in zip(
-                owned_page_keys,
-                owned_storage_keys,
-                owned_buffers,
-                prepared["file_paths"],
-            ):
-                idx = 0
-                group = grouped.setdefault(
-                    idx,
-                    {
-                        "buffers": [],
-                        "file_paths": [],
-                        "page_versions": {},
-                        "owner_by_page": {},
-                        "storage_keys_by_page": {},
-                    },
-                )
-                group["buffers"].append(buffer)
-                group["file_paths"].append(file_path)
-                group["page_versions"][page_key] = prepared["page_versions"][page_key]
-                group["owner_by_page"][page_key] = self.tp_rank
-                group["storage_keys_by_page"].setdefault(page_key, []).append(
-                    storage_key
-                )
-
-            futures = [
-                self.write_executor.submit(
-                    self._execute_file_write_group,
-                    group["buffers"],
-                    group["file_paths"],
-                    group["page_versions"],
-                    group["owner_by_page"],
-                    group["storage_keys_by_page"],
-                    self.write_contexts[idx],
-                )
-                for idx, group in grouped.items()
-            ]
-            success = all(future.result() for future in futures)
+            success = self._submit_file_write_groups(grouped)
         else:  # mem_type == "OBJ"
             success = self._execute_transfer_parallel(
                 src, key_strs, "WRITE", self.write_contexts, self.write_executor
