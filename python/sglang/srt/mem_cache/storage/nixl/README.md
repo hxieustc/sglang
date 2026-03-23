@@ -29,8 +29,10 @@ The main storage connector that provides:
 - Single and batch tensor set/get operations
 - Automatic backend selection (3FS > POSIX > GDS_MT > GDS > OBJ)
 - High-performance file-based (or) object based storage access using NIXL
-- Dedicated NIXL query agent plus pooled read/write agents for concurrent controller threads
-- HF3FS-style throughput scaling for transfer-heavy get/set paths via `numjobs`
+- A dedicated query agent for storage hit checks
+- Immutable versioned FILE writes with committed metadata
+- Owner-only publishing across TP ranks for FILE mode
+- Lazy GC of superseded FILE versions
 
 ### NixlUtils
 Consolidated utility classes:
@@ -38,10 +40,11 @@ Consolidated utility classes:
 - **NixlBackendConfig** - Handles backend configuration
 - **NixlRegistration** - Manages memory registration for tensors, files and objects
 - **NixlFileManager** - Handles file system operations and NIXL tuple creation
+- **NixlPageCommitIndex** - Tracks committed FILE versions
 
 ## Design Notes
 
-### Why NIXL Uses Multiple Agents
+### Why FILE Mode Uses Versioned Commits
 
 HiCache drives storage work from multiple controller threads:
 
@@ -49,23 +52,25 @@ HiCache drives storage work from multiple controller threads:
 - prefetch I/O calls `batch_get_v1()`
 - backup/writeback calls `batch_set_v1()`
 
-The NIXL backend now mirrors the concurrency philosophy used by HF3FS:
+For FILE backends, correctness depends on a committed-version protocol instead of raw file visibility:
 
-- one dedicated **query agent** handles `query_memory()`
-- a pool of **read agents** handles transfer-heavy get paths
-- a pool of **write agents** handles transfer-heavy set paths
+- writes create immutable versioned files
+- a metadata record publishes the committed version that readers may consume
+- `batch_exists()` and FILE reads use committed metadata, not bare file presence
+- only the deterministic owner TP rank for a logical page may publish a new committed version
+- superseded versions are queued for lazy deletion after a grace period
 
-This avoids sharing a single NIXL native agent across unrelated controller threads, while still allowing throughput scaling for larger transfer batches.
+This prevents readers from observing partially written files and avoids multi-process last-writer-wins races on the committed page view.
 
-### Throughput Scaling with `numjobs`
+### FILE-Mode Execution Model
 
-Read and write transfers are chunked and fanned out across multiple NIXL agents using a thread pool, similar to how HF3FS distributes work across multiple clients.
+FILE mode is intentionally conservative with the current NIXL POSIX backend:
 
-- `numjobs` controls the size of the read/write agent pools
-- default `numjobs` is **4**
-- `numjobs` is a **runtime-only** HiCache/NIXL setting and is **not** forwarded to NIXL plugin backend initialization
+- one dedicated **query agent** handles `batch_exists()`
+- FILE transfers run through a single serialized execution lane inside the process
+- runtime knobs like `numjobs` are still accepted, but FILE-mode transfer execution remains serialized for stability
 
-This design keeps backend plugin init params clean while allowing transfer parallelism to be tuned independently.
+Runtime-only knobs are consumed by HiCache and are not forwarded to NIXL backend initialization.
 
 ### File Layout for FILE Backends
 
@@ -166,6 +171,7 @@ Example TOML snippet showing both backend config and runtime transfer scaling:
 [runtime]
 numjobs = 4
 file_layout = "hashed2"
+file_gc_grace_seconds = 300
 
 [plugin.posix]
 active = true
@@ -194,7 +200,7 @@ python3 -m sglang.launch_server \
   --hicache-size 64 \
   --hicache-write-policy write_through \
   --hicache-storage-backend nixl \
-  --hicache-storage-backend-extra-config "{'use_uring': 'true', 'numjobs': 4, 'file_layout': 'hashed2'}"
+  --hicache-storage-backend-extra-config "{'use_uring': 'true', 'numjobs': 4, 'file_layout': 'hashed2', 'file_gc_grace_seconds': 300}"
 ```
 
 ⚠️ **Note**:
@@ -245,10 +251,18 @@ Tests for this integration, a test suite can be found at `test_hicache_nixl_stor
 - Tensor registration with memory type detection
 - File registration using NIXL tuples
 
-### Runtime / Concurrency Tests (3 tests)
+### Runtime / Concurrency Tests
 - Runtime-only config filtering for backend init params
-- Default `numjobs=4` agent-pool creation
+- Default `numjobs=4` configuration with serialized FILE execution
 - Runtime override of `numjobs`
+- Concurrent FILE-mode `batch_get_v1()` / `batch_set_v1()` stress coverage across multiple Python threads
+- Multi-process owner-rank publishing behavior
+
+### Versioned FILE Commit / GC Tests
+- Atomic committed metadata publish/load
+- Previous committed version enqueued for lazy GC
+- Startup GC scan removing stale stable files
+- Stats coverage for skipped non-owner writes and committed publishes
 
 ### File Layout Tests (5 tests)
 - Default `hashed2` path generation
@@ -281,15 +295,22 @@ If NIXL operations fail:
 
 ### Throughput Tuning
 If transfer throughput is lower than expected:
-- Check the effective `numjobs` value in `extra_config`
-- Increase `numjobs` only when the backend and filesystem can sustain parallel transfer work
-- For single-threaded or very small batch workloads, larger `numjobs` may add overhead rather than improve throughput
+- Check the effective runtime config in `extra_config`
+- For FILE backends, prioritize correctness and metadata layout tuning first; transfer execution is serialized today
+- For non-FILE backends, increase `numjobs` only when the backend and filesystem can sustain parallel transfer work
 
 ### File Layout Tuning
 If FILE backend metadata access becomes a bottleneck:
 - keep the default `hashed2` layout for better directory fanout
 - consider `flat` only for compatibility testing or if your filesystem performs better with a single directory
 - when comparing layouts, measure metadata-heavy workloads rather than only large sequential transfer bandwidth
+
+### FILE-Mode Operational Signals
+The backend now logs and tracks:
+- skipped non-owner writes
+- committed version publishes
+- pending GC queue length
+- stale-version deletions
 
 ## File Structure
 

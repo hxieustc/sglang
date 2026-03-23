@@ -112,6 +112,12 @@ class HiCacheNixl(HiCacheStorage):
             nixlconfig.get_runtime_param("file_gc_grace_seconds", 300.0)
         )
         self._pending_gc: List[tuple[float, str]] = []
+        self._file_stats = {
+            "skipped_non_owner_writes": 0,
+            "committed_version_publishes": 0,
+            "pending_gc_queue_max": 0,
+            "stale_version_deletions": 0,
+        }
 
         self.query_ctx = self._create_agent_context("query")
         self.backend_selector = self.query_ctx.backend_selector
@@ -145,6 +151,7 @@ class HiCacheNixl(HiCacheStorage):
         self.agent_name = self.read_ctx.agent_name
         self.agent = self.read_ctx.agent
         self.registration = self.read_ctx.registration
+        self._startup_gc_scan_pending = self.backend_selector.mem_type == "FILE"
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
@@ -221,6 +228,21 @@ class HiCacheNixl(HiCacheStorage):
     def _get_page_owner_rank(self, page_key: str) -> int:
         return self._get_agent_index(page_key, self.tp_size)
 
+    def _record_file_stat(self, key: str, delta: int = 1) -> None:
+        self._file_stats[key] += delta
+
+    def _log_file_metric(self, message: str, level: int = logging.DEBUG) -> None:
+        logger.log(level, message)
+
+    def _record_skipped_non_owner_writes(self, skipped_count: int) -> None:
+        if skipped_count <= 0:
+            return
+        self._record_file_stat("skipped_non_owner_writes", skipped_count)
+        self._log_file_metric(
+            "NIXL FILE skipped non-owner writes "
+            f"count={skipped_count} local_rank={self.tp_rank}"
+        )
+
     def _resolve_committed_file_paths(
         self, page_keys: List[str], storage_keys: List[str]
     ) -> Optional[List[str]]:
@@ -251,6 +273,35 @@ class HiCacheNixl(HiCacheStorage):
 
         return {"page_versions": page_versions, "file_paths": file_paths}
 
+    def _collect_local_owned_write_items(
+        self,
+        page_keys: List[str],
+        storage_keys: List[str],
+        buffers: List[torch.Tensor | tuple],
+    ) -> List[tuple[str, str, torch.Tensor | tuple]]:
+        owned_items: List[tuple[str, str, torch.Tensor | tuple]] = []
+        skipped_count = 0
+        for page_key, storage_key, buffer in zip(page_keys, storage_keys, buffers):
+            owner_rank = self._get_page_owner_rank(page_key)
+            if owner_rank != self.tp_rank:
+                skipped_count += 1
+                continue
+            owned_items.append((page_key, storage_key, buffer))
+        self._record_skipped_non_owner_writes(skipped_count)
+        return owned_items
+
+    def _get_storage_keys_for_scan_entry(
+        self, page_key: str, entry: Dict[str, Any]
+    ) -> List[str]:
+        storage_keys = entry.get("storage_keys")
+        if storage_keys:
+            return list(storage_keys)
+        if self.is_zero_copy:
+            if self.is_mla_model:
+                return [f"{page_key}_k"]
+            return [f"{page_key}_k", f"{page_key}_v"]
+        return [page_key]
+
     def _publish_page_versions(
         self,
         page_versions: Dict[str, str],
@@ -261,9 +312,18 @@ class HiCacheNixl(HiCacheStorage):
             previous_version = self.commit_index.load_committed_version(page_key)
             owner = owner_by_page.get(page_key) if owner_by_page else None
             if not self.commit_index.publish_committed_version(
-                page_key, version, owner
+                page_key,
+                version,
+                owner,
+                storage_keys=(
+                    storage_keys_by_page.get(page_key) if storage_keys_by_page else None
+                ),
             ):
                 return False
+            self._record_file_stat("committed_version_publishes")
+            self._log_file_metric(
+                f"NIXL FILE committed version publish page_key={page_key} version={version} owner_rank={owner}"
+            )
             if (
                 previous_version
                 and previous_version != version
@@ -278,6 +338,12 @@ class HiCacheNixl(HiCacheStorage):
                             ),
                         )
                     )
+        self._file_stats["pending_gc_queue_max"] = max(
+            self._file_stats["pending_gc_queue_max"], len(self._pending_gc)
+        )
+        self._log_file_metric(
+            f"NIXL FILE pending GC queue length={len(self._pending_gc)}"
+        )
         self._drain_pending_gc()
         return True
 
@@ -312,10 +378,50 @@ class HiCacheNixl(HiCacheStorage):
             try:
                 if os.path.exists(file_path):
                     os.remove(file_path)
+                    self._record_file_stat("stale_version_deletions")
+                    self._log_file_metric(
+                        f"NIXL FILE deleted stale version {file_path}"
+                    )
             except Exception as e:
                 logger.warning(f"Failed to remove stale NIXL file {file_path}: {e}")
                 keep.append((created_at, file_path))
         self._pending_gc = keep
+
+    def _enqueue_stale_versions_from_scan(self) -> None:
+        if self.file_gc_grace_seconds < 0 or not self.file_manager.base_dir:
+            return
+
+        committed_paths = set()
+        for meta_path, entry in self.commit_index.iter_entries():
+            version = entry.get("version")
+            page_key = os.path.basename(meta_path)[: -len(".meta.json")]
+            for storage_key in self._get_storage_keys_for_scan_entry(page_key, entry):
+                committed_paths.add(
+                    self.file_manager.get_versioned_file_path(storage_key, version)
+                )
+
+        now = time.monotonic()
+        for root, _, files in os.walk(self.file_manager.base_dir):
+            for file_name in files:
+                if ".v." not in file_name or file_name.endswith(".meta.json"):
+                    continue
+                file_path = os.path.join(root, file_name)
+                if file_path in committed_paths:
+                    continue
+                try:
+                    age = time.time() - os.path.getmtime(file_path)
+                except OSError:
+                    continue
+                if age >= self.file_gc_grace_seconds:
+                    self._pending_gc.append(
+                        (now - self.file_gc_grace_seconds, file_path)
+                    )
+
+        self._file_stats["pending_gc_queue_max"] = max(
+            self._file_stats["pending_gc_queue_max"], len(self._pending_gc)
+        )
+        self._drain_pending_gc()
+        self._startup_gc_scan_pending = False
 
     def _execute_transfer_parallel(
         self,
@@ -610,20 +716,27 @@ class HiCacheNixl(HiCacheStorage):
 
         if self.backend_selector.mem_type == "FILE":
             page_keys = [self._get_page_key(key) for key in keys]
+            owned_items = self._collect_local_owned_write_items(
+                page_keys, suffixed_keys, values
+            )
+            if not owned_items:
+                return True
+            owned_page_keys = [item[0] for item in owned_items]
+            owned_storage_keys = [item[1] for item in owned_items]
+            owned_buffers = [item[2] for item in owned_items]
             prepared = self._prepare_versioned_write_file_paths(
-                page_keys, suffixed_keys
+                owned_page_keys, owned_storage_keys
             )
             if prepared is None:
                 logger.error("Failed to prepare files for write")
                 return False
             grouped: Dict[int, Dict[str, Any]] = {}
-            for key, value, storage_key, file_path in zip(
-                keys, values, suffixed_keys, prepared["file_paths"]
+            for page_key, storage_key, value, file_path in zip(
+                owned_page_keys,
+                owned_storage_keys,
+                owned_buffers,
+                prepared["file_paths"],
             ):
-                page_key = self._get_page_key(key)
-                owner_rank = self._get_page_owner_rank(page_key)
-                if owner_rank != self.tp_rank:
-                    continue
                 idx = 0
                 group = grouped.setdefault(
                     idx,
@@ -638,13 +751,10 @@ class HiCacheNixl(HiCacheStorage):
                 group["buffers"].append(value)
                 group["file_paths"].append(file_path)
                 group["page_versions"][page_key] = prepared["page_versions"][page_key]
-                group["owner_by_page"][page_key] = owner_rank
+                group["owner_by_page"][page_key] = self.tp_rank
                 group["storage_keys_by_page"].setdefault(page_key, []).append(
                     storage_key
                 )
-
-            if not grouped:
-                return True
 
             futures = [
                 self.write_executor.submit(
@@ -684,6 +794,8 @@ class HiCacheNixl(HiCacheStorage):
             "page_first",
             "page_first_direct",
         ]
+        if self._startup_gc_scan_pending and self.backend_selector.mem_type == "FILE":
+            self._enqueue_stale_versions_from_scan()
 
         logger.info(
             f"HiCacheNixl: Registered mem_pool_host with layout {self.mem_pool_host.layout}, zero_copy set to {self.is_zero_copy}"
@@ -966,17 +1078,27 @@ class HiCacheNixl(HiCacheStorage):
 
         if self.backend_selector.mem_type == "FILE":
             page_keys = self._expand_page_keys(keys)
-            prepared = self._prepare_versioned_write_file_paths(page_keys, key_strs)
+            owned_items = self._collect_local_owned_write_items(
+                page_keys, key_strs, src
+            )
+            if not owned_items:
+                return [True] * len(keys)
+            owned_page_keys = [item[0] for item in owned_items]
+            owned_storage_keys = [item[1] for item in owned_items]
+            owned_buffers = [item[2] for item in owned_items]
+            prepared = self._prepare_versioned_write_file_paths(
+                owned_page_keys, owned_storage_keys
+            )
             if prepared is None:
                 logger.error("Failed to prepare files for transfer")
                 return [False] * len(keys)
             grouped: Dict[int, Dict[str, Any]] = {}
-            for page_key, storage_key, file_path, buffer in zip(
-                page_keys, key_strs, prepared["file_paths"], src
+            for page_key, storage_key, buffer, file_path in zip(
+                owned_page_keys,
+                owned_storage_keys,
+                owned_buffers,
+                prepared["file_paths"],
             ):
-                owner_rank = self._get_page_owner_rank(page_key)
-                if owner_rank != self.tp_rank:
-                    continue
                 idx = 0
                 group = grouped.setdefault(
                     idx,
@@ -991,13 +1113,10 @@ class HiCacheNixl(HiCacheStorage):
                 group["buffers"].append(buffer)
                 group["file_paths"].append(file_path)
                 group["page_versions"][page_key] = prepared["page_versions"][page_key]
-                group["owner_by_page"][page_key] = owner_rank
+                group["owner_by_page"][page_key] = self.tp_rank
                 group["storage_keys_by_page"].setdefault(page_key, []).append(
                     storage_key
                 )
-
-            if not grouped:
-                return [True] * len(keys)
 
             futures = [
                 self.write_executor.submit(
@@ -1058,3 +1177,11 @@ class HiCacheNixl(HiCacheStorage):
         self.read_executor.shutdown(wait=True)
         if self.write_executor is not self.read_executor:
             self.write_executor.shutdown(wait=True)
+
+    def get_stats(self):
+        if self.backend_selector.mem_type != "FILE":
+            return None
+        return {
+            **self._file_stats,
+            "pending_gc_queue_len": len(self._pending_gc),
+        }

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
+import concurrent.futures
+import multiprocessing
 import os
+import threading
 import unittest
 from typing import List
 from unittest.mock import MagicMock
@@ -17,6 +20,76 @@ from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
     NixlRegistration,
 )
 from sglang.srt.mem_cache.storage.nixl.page_commit_index import NixlPageCommitIndex
+
+
+class _FakeHostKVCache:
+    def __init__(self, page_size: int = 1, dtype: torch.dtype = torch.float32):
+        self.page_size = page_size
+        self.layout = "layer_first"
+        self.dtype = dtype
+        self._shape = (2, 1, self.page_size, 1, 1)
+        self._lock = threading.RLock()
+        self._pages = {}
+
+    def get_data_page(self, index: int, flat: bool = True) -> torch.Tensor:
+        with self._lock:
+            if index not in self._pages:
+                self._pages[index] = torch.full(
+                    self._shape, float(index), dtype=self.dtype
+                )
+            return self._pages[index].clone()
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        return torch.zeros(self._shape, dtype=self.dtype)
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        with self._lock:
+            self._pages[index] = data_page.clone()
+
+    def get_page_buffer_meta(self, indices):
+        ptr_list = []
+        size_list = []
+        for idx in indices[:: self.page_size]:
+            tensor = self.get_data_page(int(idx), flat=False)
+            ptr_list.append(tensor.data_ptr())
+            size_list.append(tensor.numel() * tensor.element_size())
+        return ptr_list, size_list
+
+
+def _owner_publish_worker(test_dir: str, rank: int, tp_size: int, key: str, queue):
+    os.environ["SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR"] = test_dir
+    storage_config = HiCacheStorageConfig(
+        tp_rank=rank,
+        tp_size=tp_size,
+        pp_rank=0,
+        pp_size=1,
+        is_mla_model=False,
+        enable_storage_metrics=False,
+        is_page_first_layout=False,
+        model_name="test_model",
+        extra_config={
+            "runtime": {"file_gc_grace_seconds": 0},
+            "plugin": {"posix": {"active": True}},
+        },
+    )
+    hicache = HiCacheNixl(storage_config=storage_config)
+    try:
+        hicache._execute_transfer = (
+            lambda buffers, keys, direction, ctx, lock_held=False: True
+        )
+        tensor = torch.ones(2, 2, dtype=torch.float32) * (rank + 1)
+        page_key = hicache._get_page_key(key)
+        queue.put(
+            {
+                "rank": rank,
+                "ok": hicache.set(key, tensor),
+                "owner_rank": hicache._get_page_owner_rank(page_key),
+                "stats": hicache.get_stats(),
+                "exists": hicache.batch_exists([key]),
+            }
+        )
+    finally:
+        hicache.close()
 
 
 class TestNixlUnified(unittest.TestCase):
@@ -468,6 +541,146 @@ class TestNixlUnified(unittest.TestCase):
             "Expected stale version to be queued for lazy GC",
         )
 
+    def test_non_owner_write_does_not_create_orphaned_version_files(self):
+        """Non-owner writes should not create versioned files that can never be committed."""
+        storage_config = HiCacheStorageConfig(
+            tp_rank=1,
+            tp_size=2,
+            pp_rank=0,
+            pp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name="test_model",
+            extra_config={"plugin": {"posix": {"active": True}}},
+        )
+        hicache = HiCacheNixl(storage_config=storage_config)
+        try:
+            hicache._execute_transfer = (
+                lambda buffers, keys, direction, ctx, lock_held=False: True
+            )
+            key = "non_owner_orphan_page"
+            page_key = hicache._get_page_key(key)
+            if hicache._get_page_owner_rank(page_key) == hicache.tp_rank:
+                self.skipTest("Chosen key hashes to local owner rank")
+            self.assertTrue(hicache.set(key, torch.randn(2, 2)))
+            versioned_paths = []
+            for root, _, files in os.walk(self.test_dir):
+                for file_name in files:
+                    if ".v." in file_name:
+                        versioned_paths.append(os.path.join(root, file_name))
+            self.assertEqual(versioned_paths, [])
+        finally:
+            hicache.close()
+
+    def test_startup_gc_scan_removes_stale_stable_versions(self):
+        """Startup GC scan should delete old uncommitted versioned files."""
+        page_key = self.hicache._get_page_key("startup_gc_page")
+        storage_key = page_key
+        committed_version = "committed"
+        stale_version = "stale"
+        committed_path = self.file_manager.get_versioned_file_path(
+            storage_key, committed_version
+        )
+        stale_path = self.file_manager.get_versioned_file_path(
+            storage_key, stale_version
+        )
+        self.file_manager.create_file(committed_path)
+        self.file_manager.create_file(stale_path)
+        self.assertTrue(
+            self.commit_index.publish_committed_version(
+                page_key,
+                committed_version,
+                owner=self.hicache.tp_rank,
+                storage_keys=[storage_key],
+            )
+        )
+
+        storage_config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name="test_model",
+            extra_config={
+                "runtime": {"file_gc_grace_seconds": 0},
+                "plugin": {"posix": {"active": True}},
+            },
+        )
+
+        hicache = HiCacheNixl(storage_config=storage_config)
+        try:
+            hicache.register_mem_pool_host(_FakeHostKVCache(page_size=1))
+            self.assertTrue(os.path.exists(committed_path))
+            self.assertFalse(os.path.exists(stale_path))
+            stats = hicache.get_stats()
+            self.assertGreaterEqual(stats["stale_version_deletions"], 1)
+        finally:
+            hicache.close()
+
+    def test_startup_gc_scan_preserves_committed_files_without_storage_keys(self):
+        """Startup scan must preserve older metadata files that do not record storage_keys."""
+        page_key = self.hicache._get_page_key("legacy_gc_page")
+        committed_version = "legacy"
+        committed_path = self.file_manager.get_versioned_file_path(
+            page_key, committed_version
+        )
+        self.file_manager.create_file(committed_path)
+        meta_path = self.file_manager.get_metadata_path(page_key)
+        os.makedirs(os.path.dirname(meta_path), exist_ok=True)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            f.write(
+                f'{{"owner": {self.hicache.tp_rank}, "version": "{committed_version}"}}'
+            )
+
+        storage_config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name="test_model",
+            extra_config={
+                "runtime": {"file_gc_grace_seconds": 0},
+                "plugin": {"posix": {"active": True}},
+            },
+        )
+
+        hicache = HiCacheNixl(storage_config=storage_config)
+        try:
+            self.assertTrue(os.path.exists(committed_path))
+        finally:
+            hicache.close()
+
+    def test_startup_gc_scan_is_deferred_until_mem_pool_registration(self):
+        """FILE startup GC scan should wait until zero-copy layout is known."""
+        storage_config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=True,
+            model_name="test_model",
+            extra_config={
+                "runtime": {"file_gc_grace_seconds": 0},
+                "plugin": {"posix": {"active": True}},
+            },
+        )
+        hicache = HiCacheNixl(storage_config=storage_config)
+        try:
+            self.assertTrue(hicache._startup_gc_scan_pending)
+            hicache.register_mem_pool_host(_FakeHostKVCache(page_size=1))
+            self.assertFalse(hicache._startup_gc_scan_pending)
+        finally:
+            hicache.close()
+
     def test_hicache_default_file_layout_is_hashed2(self):
         """HiCache should default to the hashed2 NIXL file layout."""
         self.assertEqual(self.hicache.file_manager.layout, "hashed2")
@@ -505,6 +718,125 @@ class TestNixlUnified(unittest.TestCase):
         version = self.commit_index.make_version_id()
         self.assertTrue(self.commit_index.publish_committed_version(page_key, version))
         self.assertEqual(self.hicache.batch_exists([key]), 1)
+
+    def test_file_mode_reports_stats_for_skipped_publishes(self):
+        """Skipped non-owner writes and committed publishes should surface in stats."""
+        storage_config = HiCacheStorageConfig(
+            tp_rank=1,
+            tp_size=2,
+            pp_rank=0,
+            pp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name="test_model",
+            extra_config={"plugin": {"posix": {"active": True}}},
+        )
+        hicache = HiCacheNixl(storage_config=storage_config)
+        try:
+            hicache._execute_transfer = (
+                lambda buffers, keys, direction, ctx, lock_held=False: True
+            )
+            key = "non_owner_stats_page"
+            page_key = hicache._get_page_key(key)
+            if hicache._get_page_owner_rank(page_key) == hicache.tp_rank:
+                self.skipTest("Chosen key hashes to local owner rank")
+            self.assertTrue(hicache.set(key, torch.randn(2, 2)))
+            stats = hicache.get_stats()
+            self.assertEqual(stats["committed_version_publishes"], 0)
+            self.assertGreaterEqual(stats["skipped_non_owner_writes"], 1)
+        finally:
+            hicache.close()
+
+    def test_concurrent_batch_get_set_v1_file_mode_stress(self):
+        """Concurrent FILE-mode v1 get/set should preserve committed metadata semantics."""
+        storage_config = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name="test_model",
+            extra_config={
+                "runtime": {"file_gc_grace_seconds": 0},
+                "plugin": {"posix": {"active": True}},
+            },
+        )
+        hicache = HiCacheNixl(storage_config=storage_config)
+        try:
+            hicache.register_mem_pool_host(_FakeHostKVCache(page_size=1))
+            hicache._execute_transfer = (
+                lambda buffers, keys, direction, ctx, lock_held=False: True
+            )
+
+            keys = [f"stress_page_{i}" for i in range(4)]
+            host_indices = torch.arange(len(keys), dtype=torch.int64)
+            self.assertTrue(all(hicache.batch_set_v1(keys, host_indices)))
+
+            def _writer(iteration: int):
+                return hicache.batch_set_v1(keys, host_indices + iteration)
+
+            def _reader():
+                return hicache.batch_get_v1(keys, host_indices)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                futures = []
+                for iteration in range(6):
+                    futures.append(executor.submit(_writer, iteration))
+                    futures.append(executor.submit(_reader))
+                results = [future.result() for future in futures]
+
+            for result in results:
+                self.assertEqual(len(result), len(keys))
+                self.assertTrue(all(isinstance(item, bool) for item in result))
+
+            self.assertEqual(hicache.batch_exists(keys), len(keys))
+            stats = hicache.get_stats()
+            self.assertGreaterEqual(stats["committed_version_publishes"], len(keys))
+            self.assertGreaterEqual(stats["stale_version_deletions"], 1)
+            self.assertGreaterEqual(
+                stats["pending_gc_queue_max"], stats["pending_gc_queue_len"]
+            )
+        finally:
+            hicache.close()
+
+    def test_multi_process_owner_rank_publish_behavior(self):
+        """Across TP processes, only the owner rank should publish a committed version."""
+        ctx = multiprocessing.get_context("spawn")
+        key = "multi_process_owner_page"
+        queue = ctx.Queue()
+        processes = [
+            ctx.Process(
+                target=_owner_publish_worker,
+                args=(self.test_dir, rank, 2, key, queue),
+            )
+            for rank in range(2)
+        ]
+
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=30)
+            self.assertEqual(process.exitcode, 0)
+
+        results = [queue.get(timeout=5) for _ in processes]
+        owner_rank = results[0]["owner_rank"]
+        self.assertTrue(all(result["owner_rank"] == owner_rank for result in results))
+
+        publish_counts = {
+            result["rank"]: result["stats"]["committed_version_publishes"]
+            for result in results
+        }
+        skip_counts = {
+            result["rank"]: result["stats"]["skipped_non_owner_writes"]
+            for result in results
+        }
+        self.assertEqual(publish_counts[owner_rank], 1)
+        self.assertEqual(skip_counts[owner_rank], 0)
+        self.assertEqual(publish_counts[1 - owner_rank], 0)
+        self.assertGreaterEqual(skip_counts[1 - owner_rank], 1)
 
 
 if __name__ == "__main__":

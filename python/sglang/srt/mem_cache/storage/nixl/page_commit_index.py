@@ -40,13 +40,19 @@ class NixlPageCommitIndex:
         return entry.get("version")
 
     def publish_committed_version(
-        self, page_key: str, version: str, owner: Optional[int] = None
+        self,
+        page_key: str,
+        version: str,
+        owner: Optional[int] = None,
+        storage_keys: Optional[list[str]] = None,
     ) -> bool:
         meta_path = self.get_metadata_path(page_key)
         temp_path = f"{meta_path}.{uuid.uuid4().hex}.tmp"
         payload = {"version": version}
         if owner is not None:
             payload["owner"] = owner
+        if storage_keys is not None:
+            payload["storage_keys"] = list(storage_keys)
 
         try:
             os.makedirs(os.path.dirname(meta_path), exist_ok=True)
@@ -66,3 +72,18 @@ class NixlPageCommitIndex:
             except Exception:
                 pass
             return False
+
+    def iter_entries(self):
+        for root, _, files in os.walk(self.file_manager.base_dir):
+            for file_name in files:
+                if not file_name.endswith(".meta.json"):
+                    continue
+                meta_path = os.path.join(root, file_name)
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        entry = json.load(f)
+                    yield meta_path, entry
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to iterate NIXL committed-page metadata {meta_path}: {e}"
+                    )
