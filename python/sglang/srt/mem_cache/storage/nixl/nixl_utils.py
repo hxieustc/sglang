@@ -283,6 +283,14 @@ class NixlFileManager:
             return os.path.join(self.base_dir, level1, level2, key)
         return os.path.join(self.base_dir, key)
 
+    def get_versioned_file_path(self, key: str, version: str) -> str:
+        """Get the immutable versioned file path for a storage key."""
+        return f"{self.get_file_path(key)}.v.{version}"
+
+    def get_metadata_path(self, key: str) -> str:
+        """Get the metadata path that stores the committed version for a page."""
+        return f"{self.get_file_path(key)}.meta.json"
+
     def create_file(self, file_path: str) -> bool:
         """Create a file if it doesn't exist."""
         try:

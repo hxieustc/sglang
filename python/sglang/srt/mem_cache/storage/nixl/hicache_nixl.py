@@ -1,9 +1,12 @@
 import concurrent.futures
+import hashlib
 import logging
+import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
@@ -21,6 +24,7 @@ from .nixl_utils import (
     NixlFileManager,
     NixlRegistration,
 )
+from .page_commit_index import NixlPageCommitIndex
 
 try:
     from nixl._api import nixl_agent, nixl_agent_config
@@ -41,6 +45,7 @@ class _NixlAgentContext:
     agent: Any
     registration: NixlRegistration
     backend_selector: NixlBackendSelection
+    lock: threading.RLock
 
 
 @dataclass
@@ -75,6 +80,9 @@ class HiCacheNixl(HiCacheStorage):
             if plugin not in NixlBackendSelection.OBJ_PLUGINS
             else None
         )
+        self.commit_index = (
+            NixlPageCommitIndex(self.file_manager) if self.file_manager else None
+        )
 
         # Initialize suffix based on storage config
         tp_rank, tp_size, model_name = (
@@ -82,6 +90,8 @@ class HiCacheNixl(HiCacheStorage):
             storage_config.tp_size,
             storage_config.model_name,
         )
+        self.tp_rank = tp_rank
+        self.tp_size = max(1, tp_size)
 
         self.is_mla_model = storage_config.is_mla_model
         self.is_zero_copy = False
@@ -98,23 +108,39 @@ class HiCacheNixl(HiCacheStorage):
         self._nixlconfig = nixlconfig
         self._plugin = plugin
         self.num_jobs = max(1, int(nixlconfig.get_runtime_param("numjobs", 4)))
+        self.file_gc_grace_seconds = float(
+            nixlconfig.get_runtime_param("file_gc_grace_seconds", 300.0)
+        )
+        self._pending_gc: List[tuple[float, str]] = []
 
         self.query_ctx = self._create_agent_context("query")
         self.backend_selector = self.query_ctx.backend_selector
-        self.read_contexts = [
-            self._create_agent_context(f"read_{i}") for i in range(self.num_jobs)
-        ]
-        self.write_contexts = [
-            self._create_agent_context(f"write_{i}") for i in range(self.num_jobs)
-        ]
-        self.read_ctx = self.read_contexts[0]
-        self.write_ctx = self.write_contexts[0]
-        self.read_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.num_jobs, thread_name_prefix="HiCacheNixlRead"
-        )
-        self.write_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.num_jobs, thread_name_prefix="HiCacheNixlWrite"
-        )
+        if self.backend_selector.mem_type == "FILE":
+            self.file_contexts = [self._create_agent_context("file")]
+            self.file_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="HiCacheNixlFile"
+            )
+            self.read_contexts = self.file_contexts
+            self.write_contexts = self.file_contexts
+            self.read_ctx = self.file_contexts[0]
+            self.write_ctx = self.file_contexts[0]
+            self.read_executor = self.file_executor
+            self.write_executor = self.file_executor
+        else:
+            self.read_contexts = [
+                self._create_agent_context(f"read_{i}") for i in range(self.num_jobs)
+            ]
+            self.write_contexts = [
+                self._create_agent_context(f"write_{i}") for i in range(self.num_jobs)
+            ]
+            self.read_ctx = self.read_contexts[0]
+            self.write_ctx = self.write_contexts[0]
+            self.read_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.num_jobs, thread_name_prefix="HiCacheNixlRead"
+            )
+            self.write_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.num_jobs, thread_name_prefix="HiCacheNixlWrite"
+            )
 
         self.agent_name = self.read_ctx.agent_name
         self.agent = self.read_ctx.agent
@@ -148,6 +174,7 @@ class HiCacheNixl(HiCacheStorage):
             agent=agent,
             registration=NixlRegistration(agent),
             backend_selector=backend_selector,
+            lock=threading.RLock(),
         )
 
     def _chunk_transfer_items(
@@ -174,6 +201,122 @@ class HiCacheNixl(HiCacheStorage):
             start = end
         return chunks
 
+    def _get_page_key(self, key: str) -> str:
+        return self._get_suffixed_key(key)
+
+    def _expand_page_keys(self, keys: List[str]) -> List[str]:
+        page_keys = []
+        for key in keys:
+            page_key = self._get_page_key(key)
+            if self.is_zero_copy and not self.is_mla_model:
+                page_keys.extend([page_key, page_key])
+            else:
+                page_keys.append(page_key)
+        return page_keys
+
+    def _get_agent_index(self, page_key: str, num_contexts: int) -> int:
+        digest = hashlib.blake2b(page_key.encode("utf-8"), digest_size=8).digest()
+        return int.from_bytes(digest, "big") % num_contexts
+
+    def _get_page_owner_rank(self, page_key: str) -> int:
+        return self._get_agent_index(page_key, self.tp_size)
+
+    def _resolve_committed_file_paths(
+        self, page_keys: List[str], storage_keys: List[str]
+    ) -> Optional[List[str]]:
+        file_paths = []
+        for page_key, storage_key in zip(page_keys, storage_keys):
+            version = self.commit_index.load_committed_version(page_key)
+            if version is None:
+                return None
+            file_paths.append(
+                self.file_manager.get_versioned_file_path(storage_key, version)
+            )
+        return file_paths
+
+    def _prepare_versioned_write_file_paths(
+        self, page_keys: List[str], storage_keys: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        page_versions: Dict[str, str] = {}
+        file_paths: List[str] = []
+
+        for page_key, storage_key in zip(page_keys, storage_keys):
+            version = page_versions.setdefault(
+                page_key, self.commit_index.make_version_id()
+            )
+            file_path = self.file_manager.get_versioned_file_path(storage_key, version)
+            if not self.file_manager.create_file(file_path):
+                return None
+            file_paths.append(file_path)
+
+        return {"page_versions": page_versions, "file_paths": file_paths}
+
+    def _publish_page_versions(
+        self,
+        page_versions: Dict[str, str],
+        owner_by_page: Optional[Dict[str, int]] = None,
+        storage_keys_by_page: Optional[Dict[str, List[str]]] = None,
+    ) -> bool:
+        for page_key, version in page_versions.items():
+            previous_version = self.commit_index.load_committed_version(page_key)
+            owner = owner_by_page.get(page_key) if owner_by_page else None
+            if not self.commit_index.publish_committed_version(
+                page_key, version, owner
+            ):
+                return False
+            if (
+                previous_version
+                and previous_version != version
+                and storage_keys_by_page is not None
+            ):
+                for storage_key in storage_keys_by_page.get(page_key, []):
+                    self._pending_gc.append(
+                        (
+                            time.monotonic(),
+                            self.file_manager.get_versioned_file_path(
+                                storage_key, previous_version
+                            ),
+                        )
+                    )
+        self._drain_pending_gc()
+        return True
+
+    def _execute_file_write_group(
+        self,
+        buffers: List[torch.Tensor | tuple],
+        file_paths: List[str],
+        page_versions: Dict[str, str],
+        owner_by_page: Dict[str, int],
+        storage_keys_by_page: Dict[str, List[str]],
+        ctx: _NixlAgentContext,
+    ) -> bool:
+        with ctx.lock:
+            if not self._execute_transfer(
+                buffers, file_paths, "WRITE", ctx, lock_held=True
+            ):
+                return False
+            return self._publish_page_versions(
+                page_versions, owner_by_page, storage_keys_by_page
+            )
+
+    def _drain_pending_gc(self) -> None:
+        if not self._pending_gc or self.file_gc_grace_seconds < 0:
+            return
+
+        now = time.monotonic()
+        keep: List[tuple[float, str]] = []
+        for created_at, file_path in self._pending_gc:
+            if now - created_at < self.file_gc_grace_seconds:
+                keep.append((created_at, file_path))
+                continue
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception as e:
+                logger.warning(f"Failed to remove stale NIXL file {file_path}: {e}")
+                keep.append((created_at, file_path))
+        self._pending_gc = keep
+
     def _execute_transfer_parallel(
         self,
         buffers: List[torch.Tensor | tuple],
@@ -181,14 +324,41 @@ class HiCacheNixl(HiCacheStorage):
         direction: str,
         contexts: List[_NixlAgentContext],
         executor: concurrent.futures.ThreadPoolExecutor,
+        lane_keys: Optional[List[str]] = None,
     ) -> bool:
         if len(buffers) != len(keys):
             logger.error("Mismatch between number of tensors/buffers and files/objects")
             return False
         if not keys:
             return True
+        if lane_keys is not None and len(lane_keys) != len(keys):
+            logger.error("Mismatch between transfer keys and lane keys")
+            return False
         if len(contexts) == 1 or len(keys) == 1:
-            return self._execute_transfer(buffers, keys, direction, contexts[0])
+            ctx = contexts[0]
+            if lane_keys:
+                ctx = contexts[self._get_agent_index(lane_keys[0], len(contexts))]
+            return self._execute_transfer(buffers, keys, direction, ctx)
+
+        if lane_keys is not None:
+            grouped: Dict[int, Dict[str, List[Any]]] = {}
+            for key, buffer, lane_key in zip(keys, buffers, lane_keys):
+                idx = self._get_agent_index(lane_key, len(contexts))
+                group = grouped.setdefault(idx, {"keys": [], "buffers": []})
+                group["keys"].append(key)
+                group["buffers"].append(buffer)
+
+            futures = [
+                executor.submit(
+                    self._execute_transfer,
+                    group["buffers"],
+                    group["keys"],
+                    direction,
+                    contexts[idx],
+                )
+                for idx, group in grouped.items()
+            ]
+            return all(future.result() for future in futures)
 
         chunks = self._chunk_transfer_items(keys, buffers, len(contexts))
         futures = [
@@ -235,33 +405,30 @@ class HiCacheNixl(HiCacheStorage):
         tuples = [(0, 0, key, "") for key in keys]
         return self.read_ctx.registration._register_memory(tuples, "OBJ")
 
-    def _prepare_write_file_paths(self, key_strs: List[str]) -> Optional[List[str]]:
-        file_paths = []
-        for key in key_strs:
-            file_path = self.file_manager.get_file_path(key)
-            self.file_manager.clear_ready(file_path)
-            if not self.file_manager.create_file(file_path):
-                return None
-            file_paths.append(file_path)
-        return file_paths
-
-    def _mark_file_paths_ready(self, file_paths: List[str]) -> bool:
-        for file_path in file_paths:
-            if not self.file_manager.mark_ready(file_path):
-                return False
-        return True
-
     def _execute_transfer(
         self,
         buffers: Optional[List[torch.Tensor | tuple]],
         keys: List[str],
         direction: str,
         ctx: _NixlAgentContext,
+        lock_held: bool = False,
     ) -> bool:
         if len(buffers) != len(keys):
             logger.error("Mismatch between number of tensors/buffers and files/objects")
             return False
 
+        if lock_held:
+            return self._execute_transfer_impl(buffers, keys, direction, ctx)
+        with ctx.lock:
+            return self._execute_transfer_impl(buffers, keys, direction, ctx)
+
+    def _execute_transfer_impl(
+        self,
+        buffers: Optional[List[torch.Tensor | tuple]],
+        keys: List[str],
+        direction: str,
+        ctx: _NixlAgentContext,
+    ) -> bool:
         # Registering file and object keys per transfer, to be updated when
         # pre-registration for file and object is added to HiCache.
         tuples = []
@@ -390,9 +557,17 @@ class HiCacheNixl(HiCacheStorage):
         suffixed_keys = [self._get_suffixed_key(key) for key in keys]
 
         if self.backend_selector.mem_type == "FILE":
-            file_paths = [self.file_manager.get_file_path(key) for key in suffixed_keys]
+            page_keys = [self._get_page_key(key) for key in keys]
+            file_paths = self._resolve_committed_file_paths(page_keys, suffixed_keys)
+            if file_paths is None:
+                return [None] * len(keys)
             success = self._execute_transfer_parallel(
-                dest, file_paths, "READ", self.read_contexts, self.read_executor
+                dest,
+                file_paths,
+                "READ",
+                self.read_contexts,
+                self.read_executor,
+                lane_keys=page_keys,
             )
         else:
             success = self._execute_transfer_parallel(
@@ -434,18 +609,56 @@ class HiCacheNixl(HiCacheStorage):
         suffixed_keys = [self._get_suffixed_key(key) for key in keys]
 
         if self.backend_selector.mem_type == "FILE":
-            file_paths = self._prepare_write_file_paths(suffixed_keys)
-            if file_paths is None:
+            page_keys = [self._get_page_key(key) for key in keys]
+            prepared = self._prepare_versioned_write_file_paths(
+                page_keys, suffixed_keys
+            )
+            if prepared is None:
                 logger.error("Failed to prepare files for write")
                 return False
-            success = self._execute_transfer_parallel(
-                values, file_paths, "WRITE", self.write_contexts, self.write_executor
-            )
-            if not success:
-                return False
-            if not self._mark_file_paths_ready(file_paths):
-                return False
-            return True
+            grouped: Dict[int, Dict[str, Any]] = {}
+            for key, value, storage_key, file_path in zip(
+                keys, values, suffixed_keys, prepared["file_paths"]
+            ):
+                page_key = self._get_page_key(key)
+                owner_rank = self._get_page_owner_rank(page_key)
+                if owner_rank != self.tp_rank:
+                    continue
+                idx = 0
+                group = grouped.setdefault(
+                    idx,
+                    {
+                        "buffers": [],
+                        "file_paths": [],
+                        "page_versions": {},
+                        "owner_by_page": {},
+                        "storage_keys_by_page": {},
+                    },
+                )
+                group["buffers"].append(value)
+                group["file_paths"].append(file_path)
+                group["page_versions"][page_key] = prepared["page_versions"][page_key]
+                group["owner_by_page"][page_key] = owner_rank
+                group["storage_keys_by_page"].setdefault(page_key, []).append(
+                    storage_key
+                )
+
+            if not grouped:
+                return True
+
+            futures = [
+                self.write_executor.submit(
+                    self._execute_file_write_group,
+                    group["buffers"],
+                    group["file_paths"],
+                    group["page_versions"],
+                    group["owner_by_page"],
+                    group["storage_keys_by_page"],
+                    self.write_contexts[idx],
+                )
+                for idx, group in grouped.items()
+            ]
+            return all(future.result() for future in futures)
         else:  # mem_type == "OBJ"
             return self._execute_transfer_parallel(
                 values,
@@ -487,23 +700,23 @@ class HiCacheNixl(HiCacheStorage):
     ) -> int:
         # Add suffix to key
 
+        if self.backend_selector.mem_type == "FILE":
+            committed_count = 0
+            for key in keys:
+                if (
+                    self.commit_index.load_committed_version(self._get_page_key(key))
+                    is None
+                ):
+                    return committed_count
+                committed_count += 1
+            return committed_count
+
         if self.is_zero_copy:
             key_list = self._get_key_list_from_meta(keys)
-            key_denominator = (
-                1 if self.is_mla_model else 2
-            )  # MLA model only has k buffer, no separate v buffer
+            key_denominator = 1 if self.is_mla_model else 2
         else:
             key_list = [self._get_suffixed_key(key) for key in keys]
             key_denominator = 1
-
-        if self.backend_selector.mem_type == "FILE":
-            ready_count = 0
-            for key in key_list:
-                file_path = self.file_manager.get_file_path(key)
-                if not self.file_manager.is_ready(file_path):
-                    return ready_count // key_denominator
-                ready_count += 1
-            return ready_count // key_denominator
 
         # obtain list of tuples by calling self.registration.create_query_tuples()
         tuples = []
@@ -610,15 +823,20 @@ class HiCacheNixl(HiCacheStorage):
             dest = target_tensors
 
         if self.backend_selector.mem_type == "FILE":
-            file_paths = [self.file_manager.get_file_path(key) for key in key_strs]
-            for file_path in file_paths:
-                if not self.file_manager.is_ready(file_path):
-                    logger.warning(
-                        f"HiCacheNixl batch_get_v1 skipped unreadable in-flight file {file_path}"
-                    )
-                    return [False] * len(keys)
+            page_keys = self._expand_page_keys(keys)
+            file_paths = self._resolve_committed_file_paths(page_keys, key_strs)
+            if file_paths is None:
+                logger.warning(
+                    "HiCacheNixl batch_get_v1 skipped pages without a committed version"
+                )
+                return [False] * len(keys)
             success = self._execute_transfer_parallel(
-                dest, file_paths, "READ", self.read_contexts, self.read_executor
+                dest,
+                file_paths,
+                "READ",
+                self.read_contexts,
+                self.read_executor,
+                lane_keys=page_keys,
             )
         else:
             success = self._execute_transfer_parallel(
@@ -747,17 +965,53 @@ class HiCacheNixl(HiCacheStorage):
             src = target_tensors
 
         if self.backend_selector.mem_type == "FILE":
-            file_paths = self._prepare_write_file_paths(key_strs)
-            if file_paths is None:
+            page_keys = self._expand_page_keys(keys)
+            prepared = self._prepare_versioned_write_file_paths(page_keys, key_strs)
+            if prepared is None:
                 logger.error("Failed to prepare files for transfer")
                 return [False] * len(keys)
-            success = self._execute_transfer_parallel(
-                src, file_paths, "WRITE", self.write_contexts, self.write_executor
-            )
-            if not success:
-                return [False] * len(keys)
-            if not self._mark_file_paths_ready(file_paths):
-                return [False] * len(keys)
+            grouped: Dict[int, Dict[str, Any]] = {}
+            for page_key, storage_key, file_path, buffer in zip(
+                page_keys, key_strs, prepared["file_paths"], src
+            ):
+                owner_rank = self._get_page_owner_rank(page_key)
+                if owner_rank != self.tp_rank:
+                    continue
+                idx = 0
+                group = grouped.setdefault(
+                    idx,
+                    {
+                        "buffers": [],
+                        "file_paths": [],
+                        "page_versions": {},
+                        "owner_by_page": {},
+                        "storage_keys_by_page": {},
+                    },
+                )
+                group["buffers"].append(buffer)
+                group["file_paths"].append(file_path)
+                group["page_versions"][page_key] = prepared["page_versions"][page_key]
+                group["owner_by_page"][page_key] = owner_rank
+                group["storage_keys_by_page"].setdefault(page_key, []).append(
+                    storage_key
+                )
+
+            if not grouped:
+                return [True] * len(keys)
+
+            futures = [
+                self.write_executor.submit(
+                    self._execute_file_write_group,
+                    group["buffers"],
+                    group["file_paths"],
+                    group["page_versions"],
+                    group["owner_by_page"],
+                    group["storage_keys_by_page"],
+                    self.write_contexts[idx],
+                )
+                for idx, group in grouped.items()
+            ]
+            success = all(future.result() for future in futures)
         else:  # mem_type == "OBJ"
             success = self._execute_transfer_parallel(
                 src, key_strs, "WRITE", self.write_contexts, self.write_executor
@@ -802,4 +1056,5 @@ class HiCacheNixl(HiCacheStorage):
 
     def close(self) -> None:
         self.read_executor.shutdown(wait=True)
-        self.write_executor.shutdown(wait=True)
+        if self.write_executor is not self.read_executor:
+            self.write_executor.shutdown(wait=True)

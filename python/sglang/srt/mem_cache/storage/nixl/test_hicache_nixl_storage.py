@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
     NixlFileManager,
     NixlRegistration,
 )
+from sglang.srt.mem_cache.storage.nixl.page_commit_index import NixlPageCommitIndex
 
 
 class TestNixlUnified(unittest.TestCase):
@@ -35,12 +36,13 @@ class TestNixlUnified(unittest.TestCase):
 
         # Create instances
         self.file_manager = NixlFileManager(self.test_dir)
+        self.commit_index = NixlPageCommitIndex(self.file_manager)
         self.registration = NixlRegistration(self.mock_agent)
 
         # Create storage config for testing
         self.storage_config = HiCacheStorageConfig(
             tp_rank=0,
-            tp_size=2,
+            tp_size=1,
             pp_rank=0,
             pp_size=1,
             is_mla_model=False,
@@ -240,6 +242,18 @@ class TestNixlUnified(unittest.TestCase):
         self.assertFalse(self.file_manager.is_ready(file_path))
         self.assertFalse(os.path.exists(marker_path))
 
+    def test_commit_index_publish_and_load(self):
+        """Committed versions should be atomically published and reloadable."""
+        page_key = self.hicache._get_page_key("abcdef0123456789")
+        version = self.commit_index.make_version_id()
+
+        self.assertIsNone(self.commit_index.load_committed_version(page_key))
+        self.assertTrue(
+            self.commit_index.publish_committed_version(page_key, version, owner=1)
+        )
+        self.assertEqual(self.commit_index.load_committed_version(page_key), version)
+        self.assertEqual(self.commit_index.load_entry(page_key)["owner"], 1)
+
     def test_default_file_layout_is_hashed2(self):
         """Default file layout should use a 2-level hashed directory structure."""
         key = "abcdef0123456789"
@@ -247,6 +261,19 @@ class TestNixlUnified(unittest.TestCase):
 
         self.assertEqual(self.file_manager.layout, "hashed2")
         self.assertEqual(self.file_manager.get_file_path(key), expected)
+
+    def test_versioned_and_metadata_paths_follow_layout(self):
+        """Versioned data and metadata files should follow the selected layout."""
+        key = "abcdef0123456789"
+
+        self.assertEqual(
+            self.file_manager.get_versioned_file_path(key, "v1"),
+            os.path.join(self.test_dir, "ab", "cd", f"{key}.v.v1"),
+        )
+        self.assertEqual(
+            self.file_manager.get_metadata_path(key),
+            os.path.join(self.test_dir, "ab", "cd", f"{key}.meta.json"),
+        )
 
     def test_flat_file_layout(self):
         """Flat layout should place files directly under the base directory."""
@@ -346,10 +373,10 @@ class TestNixlUnified(unittest.TestCase):
         self.assertEqual(config.get_runtime_param("numjobs", 4), 6)
 
     def test_hicache_default_numjobs_creates_agent_pools(self):
-        """HiCacheNixl should default to four transfer agents per direction."""
+        """FILE mode should keep the configured numjobs but serialize through one lane."""
         self.assertEqual(self.hicache.num_jobs, 4)
-        self.assertEqual(len(self.hicache.read_contexts), 4)
-        self.assertEqual(len(self.hicache.write_contexts), 4)
+        self.assertEqual(len(self.hicache.read_contexts), 1)
+        self.assertEqual(len(self.hicache.write_contexts), 1)
 
     def test_hicache_runtime_numjobs_override(self):
         """Runtime numjobs override should control the transfer pool size."""
@@ -371,10 +398,75 @@ class TestNixlUnified(unittest.TestCase):
         hicache = HiCacheNixl(storage_config=storage_config)
         try:
             self.assertEqual(hicache.num_jobs, 2)
-            self.assertEqual(len(hicache.read_contexts), 2)
-            self.assertEqual(len(hicache.write_contexts), 2)
+            self.assertEqual(len(hicache.read_contexts), 1)
+            self.assertEqual(len(hicache.write_contexts), 1)
         finally:
             hicache.close()
+
+    def test_same_page_has_stable_owner_rank(self):
+        """A logical page should deterministically map to one owner TP rank."""
+        page_key = self.hicache._get_page_key("logical_page")
+        owner_rank = self.hicache._get_page_owner_rank(page_key)
+        self.assertEqual(owner_rank, self.hicache._get_page_owner_rank(page_key))
+
+        expanded = self.hicache._expand_page_keys(["logical_page"])
+        for expanded_page_key in expanded:
+            self.assertEqual(
+                self.hicache._get_page_owner_rank(expanded_page_key),
+                owner_rank,
+            )
+
+    def test_non_owner_write_is_skipped(self):
+        """Non-owner ranks should not publish committed versions for a page."""
+        storage_config = HiCacheStorageConfig(
+            tp_rank=1,
+            tp_size=2,
+            pp_rank=0,
+            pp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name="test_model",
+            extra_config={"plugin": {"posix": {"active": True}}},
+        )
+
+        hicache = HiCacheNixl(storage_config=storage_config)
+        try:
+            key = "owner_controlled_page"
+            page_key = hicache._get_page_key(key)
+            owner_rank = hicache._get_page_owner_rank(page_key)
+            if owner_rank == hicache.tp_rank:
+                self.skipTest("Chosen key hashes to local owner rank")
+            self.assertTrue(hicache.set(key, torch.randn(2, 2)))
+            self.assertEqual(hicache.batch_exists([key]), 0)
+        finally:
+            hicache.close()
+
+    def test_publish_enqueues_previous_version_for_gc(self):
+        """Publishing a new committed version should queue the previous one for lazy GC."""
+        page_key = self.hicache._get_page_key("gc_page")
+        storage_key = page_key
+        old_version = "oldversion"
+        new_version = "newversion"
+        old_file = self.file_manager.get_versioned_file_path(storage_key, old_version)
+        self.file_manager.create_file(old_file)
+        self.assertTrue(
+            self.commit_index.publish_committed_version(
+                page_key, old_version, owner=self.hicache.tp_rank
+            )
+        )
+
+        self.assertTrue(
+            self.hicache._publish_page_versions(
+                {page_key: new_version},
+                {page_key: self.hicache.tp_rank},
+                {page_key: [storage_key]},
+            )
+        )
+        self.assertTrue(
+            any(path == old_file for _, path in self.hicache._pending_gc),
+            "Expected stale version to be queued for lazy GC",
+        )
 
     def test_hicache_default_file_layout_is_hashed2(self):
         """HiCache should default to the hashed2 NIXL file layout."""
@@ -403,16 +495,15 @@ class TestNixlUnified(unittest.TestCase):
         finally:
             hicache.close()
 
-    def test_batch_exists_uses_ready_markers_for_file_backend(self):
-        """FILE-mode existence should depend on ready markers, not bare file creation."""
+    def test_batch_exists_uses_committed_versions_for_file_backend(self):
+        """FILE-mode existence should depend on committed metadata, not bare files."""
         key = "abcdef0123456789"
-        suffixed_key = self.hicache._get_suffixed_key(key)
-        file_path = self.hicache.file_manager.get_file_path(suffixed_key)
+        page_key = self.hicache._get_page_key(key)
 
-        self.hicache.file_manager.create_file(file_path)
         self.assertEqual(self.hicache.batch_exists([key]), 0)
 
-        self.hicache.file_manager.mark_ready(file_path)
+        version = self.commit_index.make_version_id()
+        self.assertTrue(self.commit_index.publish_committed_version(page_key, version))
         self.assertEqual(self.hicache.batch_exists([key]), 1)
 
 
