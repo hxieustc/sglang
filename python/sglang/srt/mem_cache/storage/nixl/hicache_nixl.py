@@ -235,6 +235,22 @@ class HiCacheNixl(HiCacheStorage):
         tuples = [(0, 0, key, "") for key in keys]
         return self.read_ctx.registration._register_memory(tuples, "OBJ")
 
+    def _prepare_write_file_paths(self, key_strs: List[str]) -> Optional[List[str]]:
+        file_paths = []
+        for key in key_strs:
+            file_path = self.file_manager.get_file_path(key)
+            self.file_manager.clear_ready(file_path)
+            if not self.file_manager.create_file(file_path):
+                return None
+            file_paths.append(file_path)
+        return file_paths
+
+    def _mark_file_paths_ready(self, file_paths: List[str]) -> bool:
+        for file_path in file_paths:
+            if not self.file_manager.mark_ready(file_path):
+                return False
+        return True
+
     def _execute_transfer(
         self,
         buffers: Optional[List[torch.Tensor | tuple]],
@@ -418,17 +434,18 @@ class HiCacheNixl(HiCacheStorage):
         suffixed_keys = [self._get_suffixed_key(key) for key in keys]
 
         if self.backend_selector.mem_type == "FILE":
-            file_paths = []
-            for key in suffixed_keys:
-                file_path = self.file_manager.get_file_path(key)
-                # New file per set, to be updated when partial writes is added to HiCache
-                if not self.file_manager.create_file(file_path):
-                    logger.error(f"Failed to create file {file_path}")
-                    return False
-                file_paths.append(file_path)
-            return self._execute_transfer_parallel(
+            file_paths = self._prepare_write_file_paths(suffixed_keys)
+            if file_paths is None:
+                logger.error("Failed to prepare files for write")
+                return False
+            success = self._execute_transfer_parallel(
                 values, file_paths, "WRITE", self.write_contexts, self.write_executor
             )
+            if not success:
+                return False
+            if not self._mark_file_paths_ready(file_paths):
+                return False
+            return True
         else:  # mem_type == "OBJ"
             return self._execute_transfer_parallel(
                 values,
@@ -478,6 +495,15 @@ class HiCacheNixl(HiCacheStorage):
         else:
             key_list = [self._get_suffixed_key(key) for key in keys]
             key_denominator = 1
+
+        if self.backend_selector.mem_type == "FILE":
+            ready_count = 0
+            for key in key_list:
+                file_path = self.file_manager.get_file_path(key)
+                if not self.file_manager.is_ready(file_path):
+                    return ready_count // key_denominator
+                ready_count += 1
+            return ready_count // key_denominator
 
         # obtain list of tuples by calling self.registration.create_query_tuples()
         tuples = []
@@ -585,6 +611,12 @@ class HiCacheNixl(HiCacheStorage):
 
         if self.backend_selector.mem_type == "FILE":
             file_paths = [self.file_manager.get_file_path(key) for key in key_strs]
+            for file_path in file_paths:
+                if not self.file_manager.is_ready(file_path):
+                    logger.warning(
+                        f"HiCacheNixl batch_get_v1 skipped unreadable in-flight file {file_path}"
+                    )
+                    return [False] * len(keys)
             success = self._execute_transfer_parallel(
                 dest, file_paths, "READ", self.read_contexts, self.read_executor
             )
@@ -715,19 +747,17 @@ class HiCacheNixl(HiCacheStorage):
             src = target_tensors
 
         if self.backend_selector.mem_type == "FILE":
-            file_paths = []
-            for key in key_strs:
-                file_path = self.file_manager.get_file_path(key)
-                # New file per set, to be updated when partial writes is added to HiCache
-                if not self.file_manager.create_file(file_path):
-                    logger.error(
-                        f"******** Failed to create file {file_path} *********"
-                    )
-                    return [False] * len(keys)
-                file_paths.append(file_path)
+            file_paths = self._prepare_write_file_paths(key_strs)
+            if file_paths is None:
+                logger.error("Failed to prepare files for transfer")
+                return [False] * len(keys)
             success = self._execute_transfer_parallel(
                 src, file_paths, "WRITE", self.write_contexts, self.write_executor
             )
+            if not success:
+                return [False] * len(keys)
+            if not self._mark_file_paths_ready(file_paths):
+                return [False] * len(keys)
         else:  # mem_type == "OBJ"
             success = self._execute_transfer_parallel(
                 src, key_strs, "WRITE", self.write_contexts, self.write_executor

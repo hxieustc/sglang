@@ -224,6 +224,22 @@ class TestNixlUnified(unittest.TestCase):
         self.assertTrue(self.delete_test_file(test_file))
         self.assertFalse(os.path.exists(test_file))
 
+    def test_ready_marker_lifecycle(self):
+        """Ready markers should be created, observed, and cleared correctly."""
+        file_path = self.file_manager.get_file_path("abcdef0123456789")
+        self.file_manager.create_file(file_path)
+
+        self.assertFalse(self.file_manager.is_ready(file_path))
+        self.assertTrue(self.file_manager.mark_ready(file_path))
+        self.assertTrue(self.file_manager.is_ready(file_path))
+
+        marker_path = self.file_manager.get_marker_path(file_path)
+        self.assertTrue(os.path.exists(marker_path))
+
+        self.file_manager.clear_ready(file_path)
+        self.assertFalse(self.file_manager.is_ready(file_path))
+        self.assertFalse(os.path.exists(marker_path))
+
     def test_default_file_layout_is_hashed2(self):
         """Default file layout should use a 2-level hashed directory structure."""
         key = "abcdef0123456789"
@@ -386,6 +402,18 @@ class TestNixlUnified(unittest.TestCase):
             self.assertEqual(hicache.file_manager.layout, "flat")
         finally:
             hicache.close()
+
+    def test_batch_exists_uses_ready_markers_for_file_backend(self):
+        """FILE-mode existence should depend on ready markers, not bare file creation."""
+        key = "abcdef0123456789"
+        suffixed_key = self.hicache._get_suffixed_key(key)
+        file_path = self.hicache.file_manager.get_file_path(suffixed_key)
+
+        self.hicache.file_manager.create_file(file_path)
+        self.assertEqual(self.hicache.batch_exists([key]), 0)
+
+        self.hicache.file_manager.mark_ready(file_path)
+        self.assertEqual(self.hicache.batch_exists([key]), 1)
 
 
 if __name__ == "__main__":

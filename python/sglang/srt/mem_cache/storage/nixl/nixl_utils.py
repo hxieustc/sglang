@@ -295,6 +295,42 @@ class NixlFileManager:
             logger.error(f"Failed to create file {file_path}: {e}")
             return False
 
+    def get_marker_path(self, file_path: str) -> str:
+        """Get the ready marker path for a given data file."""
+        return f"{file_path}.ready"
+
+    def mark_ready(self, file_path: str) -> bool:
+        """Atomically create the ready marker for a fully written file."""
+        marker_path = self.get_marker_path(file_path)
+        temp_marker_path = f"{marker_path}.tmp"
+        try:
+            os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+            with open(temp_marker_path, "wb"):
+                pass
+            os.replace(temp_marker_path, marker_path)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to create ready marker for {file_path}: {e}")
+            try:
+                if os.path.exists(temp_marker_path):
+                    os.remove(temp_marker_path)
+            except Exception:
+                pass
+            return False
+
+    def clear_ready(self, file_path: str) -> None:
+        """Remove the ready marker before an overwrite begins."""
+        marker_path = self.get_marker_path(file_path)
+        try:
+            if os.path.exists(marker_path):
+                os.remove(marker_path)
+        except Exception as e:
+            logger.warning(f"Failed to remove ready marker for {file_path}: {e}")
+
+    def is_ready(self, file_path: str) -> bool:
+        """Check whether a data file has been fully written and committed."""
+        return os.path.exists(self.get_marker_path(file_path))
+
     def open_file(self, file_path: str) -> Optional[int]:
         """Open a file and return its file descriptor."""
         try:
