@@ -68,7 +68,7 @@ class HiCacheNixl(HiCacheStorage):
                 tp_rank=storage_config.tp_rank,
                 tp_size=storage_config.tp_size,
                 file_gc_grace_seconds=float(
-                    nixlconfig.get_runtime_param("file_gc_grace_seconds", 300.0)
+                    nixlconfig.get_runtime_param("file_gc_grace_seconds", 3000.0)
                 ),
             )
             if self.file_manager
