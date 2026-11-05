@@ -337,6 +337,17 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 "KVCR Python GIL switch interval pid=%s rank=%s before=%s actual=%s",
                 os.getpid(), rank, before, sys.getswitchinterval(),
             )
+        if "nixl_prog_thread_delay_us" in options:
+            delay_us = options.pop("nixl_prog_thread_delay_us")
+            if type(delay_us) is not int or delay_us not in (0, 1000):
+                raise ValueError("KVCR nixl_prog_thread_delay_us must be integer 0 or 1000")
+            from sglang.srt.mem_cache.storage.kvcr.native_progress_delay import (
+                install_native_progress_delay,
+            )
+
+            install_native_progress_delay(
+                delay_us, rank=rank, endpoint_name=self.layout.endpoint_name, logger=logger
+            )
         self._timing_rank = rank
         self._owner_timing = _OwnerTiming(rank, "owner") if profile_owner else None
         self._caller_timing = threading.local() if profile_owner else None
