@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
+import os
+import sys
 import threading
 from queue import Empty, Queue
 
@@ -78,6 +81,19 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             get_memory().hicache_storage_backend_extra_config
         )
+        if "python_gil_switch_interval_seconds" in extra_config:
+            extra_config = dict(extra_config)
+            interval = extra_config.pop("python_gil_switch_interval_seconds")
+            if type(interval) not in (int, float) or not math.isfinite(interval) or interval <= 0:
+                raise ValueError(
+                    "Mooncake python_gil_switch_interval_seconds must be finite and positive"
+                )
+            before = sys.getswitchinterval()
+            sys.setswitchinterval(interval)
+            logger.info(
+                "Mooncake Python GIL switch interval pid=%s rank=%s before=%s actual=%s",
+                os.getpid(), tp_rank, before, sys.getswitchinterval(),
+            )
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.
