@@ -170,7 +170,8 @@ class MambaPoolHost(HostKVCache):
         else:
             self.size = int(device_capacity * host_to_device_ratio)
 
-        self.page_num = self.size // self.page_size + 1
+        # Explicit byte budgets must not grow during page alignment.
+        self.page_num = self.size // self.page_size + (0 if host_size > 0 else 1)
         self.size = self.page_num * self.page_size
 
         if self.size <= device_capacity:
@@ -904,6 +905,29 @@ class MambaPoolHost(HostKVCache):
                 tensor_bytes = tensor_bytes.clone()
             restored = tensor_bytes.view(dtype=tensor.dtype).reshape(tensor.shape)
             tensor.copy_(restored)
+
+    def get_storage_page_buffer_meta(self, indices):
+        """Expose every registered checkpoint component to whole-page backends.
+
+        Side rows have independent dtype/stride and stay separate descriptors;
+        no payload is copied or omitted while the controller owns the slots.
+        """
+        if not self.slot_state_device_tensors:
+            return self.get_page_buffer_meta(indices)
+        if self.layout not in ("page_first", "page_first_direct"):
+            raise ValueError("Whole-page Mamba storage requires a page-first layout")
+        if len(indices) % self.page_size:
+            raise ValueError("Mamba storage requires complete pages")
+        pointers, sizes = [], []
+        for index in indices.tolist()[:: self.page_size]:
+            for tensor in self._iter_page_tensors(index):
+                if tensor.numel() == 0:
+                    continue
+                if not tensor.is_contiguous():
+                    raise ValueError("Mamba storage components must be contiguous")
+                pointers.append(tensor.data_ptr())
+                sizes.append(tensor.numel() * tensor.element_size())
+        return pointers, sizes
 
     def get_page_buffer_meta(self, indices):
         """Meta data for zero-copy storage I/O.

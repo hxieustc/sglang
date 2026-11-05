@@ -786,14 +786,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if pool_name == PoolName.KV:
             suffixes = [f"_{self.mla_suffix}_k"]
         elif pool_name == PoolName.MAMBA:
-            # Mamba stores one temporal object plus one object per conv state.
-            # conv-only models have no ssm state; drop the 0-element temporal
-            # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
-            # its temporal pointer under the same condition to stay aligned.
-            conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
-            if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
-                suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
+            # Match whole-page metadata order, retaining stable component indices.
+            # Empty components have neither an object key nor a buffer descriptor.
+            if host_pool.temporal_buffer.numel() > 0:
+                suffixes.append(f"_{self.mha_suffix}_temporal")
+            suffixes.extend(
+                f"_{self.mha_suffix}_conv_{i}"
+                for i, buf in enumerate(host_pool.conv_buffer)
+                if buf.numel() > 0
+            )
+            suffixes.extend(
+                f"_{self.mha_suffix}_slot_state_{i}"
+                for i, buf in enumerate(getattr(host_pool, "slot_state_buffers", ()))
+                if buf.numel() > 0
+            )
         elif pool_name == PoolName.DRAFT:
             # Draft pool's MLA/MHA layout is independent from the target
             # (e.g. EAGLE-MHA draft on top of an MLA target), so pick the
@@ -1075,7 +1081,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 ]
 
         selected_keys = [key_strs[i] for i in object_indices]
-        ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+        get_meta = getattr(host_pool, "get_storage_page_buffer_meta", None)
+        if get_meta is None:
+            get_meta = host_pool.get_page_buffer_meta
+        ptr_list, element_size_list = get_meta(host_indices)
         if len(ptr_list) != len(selected_keys):
             ptr_list, element_size_list = self._pack_multi_buffer_meta(
                 selected_keys, ptr_list, element_size_list

@@ -39,7 +39,10 @@ def describe_pool(name: str, pool) -> PoolLayout:
     count = pool.size // pool.page_size
     if pool.layout not in ("page_first", "page_first_direct") or count < 2:
         raise ValueError("KVCR requires at least two host slots in a page-first layout")
-    pointers, sizes = pool.get_page_buffer_meta(torch.arange(2 * pool.page_size))
+    page_metadata = getattr(
+        pool, "get_storage_page_buffer_meta", pool.get_page_buffer_meta
+    )
+    pointers, sizes = page_metadata(torch.arange(2 * pool.page_size))
     if not pointers or len(pointers) % 2 or len(pointers) != len(sizes):
         raise ValueError(f"Invalid host-page metadata for {name}")
     parts = len(pointers) // 2
@@ -118,6 +121,9 @@ class StorageKeyAdapter:
         if not isinstance(framework_key, bytes):
             raise TypeError("KVCR storage keys must be bytes")
         return framework_key
+
+    def encode_to_router(self, key: bytes) -> int:
+        return self.decode(key)
 
     def decode(self, key: bytes) -> int:
         # Inverts SGLang's hash_str_to_int64, as the unsigned router hash.

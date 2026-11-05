@@ -111,7 +111,7 @@ class Memory(msgspec.Struct):
         "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in buffer_only mode, or 0.2 for backup-only host-pool decode retraction.",
     ] = None
     hicache_size: A[
-        int,
+        float,
         "The size of host KV cache memory pool in gigabytes. Overrides --hicache-ratio in either host memory mode.",
     ] = 0
     hicache_host_memory_fraction: A[

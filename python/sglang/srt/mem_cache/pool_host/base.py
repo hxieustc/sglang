@@ -214,8 +214,9 @@ class HostKVCache(abc.ABC):
             )
         else:
             self.size = int(device_capacity_tokens * host_to_device_ratio)
-        # Align up the host memory pool size to the page size
-        self.page_num = self.size // self.page_size + 1
+        # Align host memory to whole pages.
+        # Explicit byte budgets must not grow during page alignment.
+        self.page_num = self.size // self.page_size + (0 if host_size > 0 else 1)
         self.size = self.page_num * self.page_size
         self.start_layer = start_layer
         self.end_layer = end_layer
