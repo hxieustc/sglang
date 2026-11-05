@@ -511,6 +511,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     transfer_engine = None
 
                 setup_kwargs = {}
+                if os.getenv("MOONCAKE_CLIENT_HTTP_PORT"):
+                    setup_kwargs.update(enable_client_http_server=True, client_http_port=int(os.environ["MOONCAKE_CLIENT_HTTP_PORT"]))
                 if self.config.enable_ssd_offload:
                     setup_kwargs["enable_ssd_offload"] = True
                 if self.config.ssd_offload_path is not None:
@@ -573,6 +575,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"Failed to setup Mooncake store, error code: {ret_code}"
                 )
             logger.info("Mooncake store setup successfully.")
+            if os.getenv("MOONCAKE_TELEMETRY_PATH"):
+                from mooncake_observer import ObservedStore
+                self.store = ObservedStore(self.store, os.environ["MOONCAKE_TELEMETRY_PATH"])
 
             self.local_rank = (
                 storage_config.tp_rank if storage_config is not None else 0

@@ -329,13 +329,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         )
                     )
             for keys, _ in batches.values():
-                result = self.storage.store.batch_get_session_start(keys)
-                if list(result) != [0] * len(keys):
+                result = list(self.storage.store.batch_get_session_start(keys))
+                started_keys = [
+                    key for key, status in zip(keys, result) if status == 0
+                ]
+                if started_keys:
+                    started.append(started_keys)
+                if result != [0] * len(keys):
                     raise RuntimeError(
                         f"Mooncake get session start failed: keys={len(keys)}, "
                         f"results={result}"
                     )
-                started.append(keys)
 
             for layer in range(self.num_layers):
                 for name, (keys, locations) in batches.items():

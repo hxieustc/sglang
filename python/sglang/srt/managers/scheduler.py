@@ -1899,6 +1899,11 @@ class Scheduler(
             "startup_time": self.startup_time,
         }
 
+        cache_core = getattr(self.tree_cache, "tree_core", self.tree_cache)
+        cache_is_eagle = getattr(cache_core, "is_eagle", None)
+        if type(cache_is_eagle) is bool:
+            result_dict["cache_key_is_eagle"] = cache_is_eagle
+
         hint_sources = self.kv_events_publisher.kv_hint_sources()
         if hint_sources:
             result_dict["kv_hint_sources"] = hint_sources

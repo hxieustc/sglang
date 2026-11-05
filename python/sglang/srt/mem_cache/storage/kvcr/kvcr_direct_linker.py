@@ -47,6 +47,63 @@ _MAX_DEPOSIT_BYTES = 512 << 20
 _MAX_DEPOSIT_DESCRIPTORS = 4096
 
 
+class _OwnerTiming:
+    """Thread-confined interval summaries; no request/key labels or samples.
+
+    Owner and each calling thread use separate instances, so observation and
+    emission need no additional locks. Values are seconds except candidates.
+    """
+
+    def __init__(self, rank, role):
+        self.rank = rank
+        self.role = role
+        self.stats = {}
+        self.last_log = time.perf_counter()
+        self.enabled = True
+
+    def observe(self, metric, value, function=""):
+        if not self.enabled:
+            return
+        key = f"{metric}[{function[:64]}]"
+        if key not in self.stats and len(self.stats) >= 64:
+            key = "overflow[]"
+        count, total, maximum = self.stats.get(key, (0, 0.0, value))
+        self.stats[key] = count + 1, total + value, max(maximum, value)
+
+    def log_stats(self):
+        if not self.enabled:
+            return
+        now = time.perf_counter()
+        elapsed = now - self.last_log
+        if elapsed < 5:
+            return
+        self.last_log = now
+        if not self.stats:
+            return
+        try:
+            logger.info(
+                "KVCR owner timing %s",
+                json.dumps(
+                    {
+                        "rank": self.rank,
+                        "role": self.role,
+                        "thread_id": threading.get_native_id(),
+                        "interval_s": elapsed,
+                        "stats": {
+                            f"{name}.{kind}": value
+                            for name, summary in self.stats.items()
+                            for kind, value in zip(("count", "sum", "max"), summary)
+                        },
+                    },
+                    sort_keys=True,
+                ),
+            )
+        except Exception:
+            # Optional diagnostics must not change transfer/error handling.
+            self.enabled = False
+        self.stats.clear()
+
+
 @dataclass
 class _Load:
     rid: str
@@ -262,6 +319,13 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             get_memory().hicache_storage_backend_extra_config
         )
         options = dict(options)
+        profile_owner = options.pop("profile_owner", False)
+        if type(profile_owner) is not bool:
+            raise ValueError("KVCR profile_owner must be a boolean")
+        self._timing_rank = rank
+        self._owner_timing = _OwnerTiming(rank, "owner") if profile_owner else None
+        self._caller_timing = threading.local() if profile_owner else None
+        self._last_progress_at = None
         self._publish_inventory = options.pop("publish_inventory", False)
         if type(self._publish_inventory) is not bool:
             raise ValueError("KVCR publish_inventory must be a boolean")
@@ -394,10 +458,32 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         ]
 
     def _call(self, function, *args):
+        timing = None
+        if self._caller_timing is not None:
+            timing = getattr(self._caller_timing, "stats", None)
+            if timing is None:
+                timing = _OwnerTiming(self._timing_rank, "caller")
+                self._caller_timing.stats = timing
+        if timing is not None:
+            started = time.perf_counter()
+        try:
+            return self._call_impl(function, *args)
+        finally:
+            if timing is not None:
+                timing.observe(
+                    "call_wall_seconds",
+                    time.perf_counter() - started,
+                    getattr(function, "__name__", type(function).__name__),
+                )
+                timing.log_stats()
+
+    def _call_impl(self, function, *args):
         future = Future()
         with self._command_lock:
             if self._closed:
                 raise RuntimeError("KVCR linker is closed")
+            if self._owner_timing is not None:
+                future._kvcr_enqueued_at = time.perf_counter()
             self._commands.put((function, args, future))
         return future.result()
 
@@ -430,10 +516,32 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     # Yield the GIL without pacing active transfers at 1 ms.
                     time.sleep(0)
             else:
+                timing = self._owner_timing
+                if timing is not None:
+                    service_started = time.perf_counter()
+                    function_name = getattr(
+                        function, "__name__", type(function).__name__
+                    )
+                    enqueued = getattr(future, "_kvcr_enqueued_at", None)
+                    if enqueued is not None:
+                        timing.observe(
+                            "call_queue_seconds",
+                            service_started - enqueued,
+                            function_name,
+                        )
                 try:
-                    if self._fatal is not None and function != self._close:
-                        raise self._fatal
-                    future.set_result(function(*args))
+                    try:
+                        if self._fatal is not None and function != self._close:
+                            raise self._fatal
+                        result = function(*args)
+                    finally:
+                        if timing is not None:
+                            timing.observe(
+                                "call_service_seconds",
+                                time.perf_counter() - service_started,
+                                function_name,
+                            )
+                    future.set_result(result)
                 except BaseException as error:
                     if function in (self._close, self._reset):
                         if hasattr(error, "kvcr_runtime"):
@@ -566,6 +674,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         return self._call(self._confirm_lookup, rid, keys, prepared, hit_pages)
 
     def _confirm_lookup(self, rid, keys, prepared, hit_pages):
+        # call_service_seconds[_confirm_lookup] measures full confirmation time.
+        if self._owner_timing is not None and hit_pages:
+            self._owner_timing.observe("confirmation_candidates", 1)
         scope = self._request_scopes.get(rid)
         if not hit_pages:
             self._discard_lookup(scope)
@@ -855,6 +966,16 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         return True
 
     def _prepare_offload(self, transfers):
+        timing = self._owner_timing
+        if timing is None:
+            return self._prepare_offload_impl(transfers)
+        started = time.perf_counter()
+        try:
+            return self._prepare_offload_impl(transfers)
+        finally:
+            timing.observe("offload_prepare_seconds", time.perf_counter() - started)
+
+    def _prepare_offload_impl(self, transfers):
         # The producer event is ready, but later compute may already occupy its
         # stream. Index readback must not stall the KVCR progress owner behind it.
         context = (
@@ -863,7 +984,16 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             else nullcontext()
         )
         with context:
-            prepared = self.layout.prepare(list(transfers), allow_partial=True)
+            timing = self._owner_timing
+            if timing is not None:
+                started = time.perf_counter()
+            try:
+                prepared = self.layout.prepare(list(transfers), allow_partial=True)
+            finally:
+                if timing is not None:
+                    timing.observe(
+                        "offload_layout_seconds", time.perf_counter() - started
+                    )
         if self._shard:
             prepared = tuple(
                 replace(
@@ -880,32 +1010,38 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     ]
                 )
             )
-        sizes = {region.label: region.size for region in self.layout.registrations}
-        batches = []
-        for blocks in self.layout.mappings(prepared):
-            batch, size, descriptors = {}, 0, 0
-            for key, refs in blocks.items():
-                key_bytes = sum(sizes[ref.label] for ref in refs)
-                if (
-                    key_bytes > _MAX_DEPOSIT_BYTES
-                    or len(refs) > _MAX_DEPOSIT_DESCRIPTORS
-                ):
-                    raise ValueError("KVCR page exceeds native deposit limits")
-                if batch and (
-                    size + key_bytes > _MAX_DEPOSIT_BYTES
-                    or descriptors + len(refs) > _MAX_DEPOSIT_DESCRIPTORS
-                ):
+        if timing is not None:
+            started = time.perf_counter()
+        try:
+            sizes = {region.label: region.size for region in self.layout.registrations}
+            batches = []
+            for blocks in self.layout.mappings(prepared):
+                batch, size, descriptors = {}, 0, 0
+                for key, refs in blocks.items():
+                    key_bytes = sum(sizes[ref.label] for ref in refs)
+                    if (
+                        key_bytes > _MAX_DEPOSIT_BYTES
+                        or len(refs) > _MAX_DEPOSIT_DESCRIPTORS
+                    ):
+                        raise ValueError("KVCR page exceeds native deposit limits")
+                    if batch and (
+                        size + key_bytes > _MAX_DEPOSIT_BYTES
+                        or descriptors + len(refs) > _MAX_DEPOSIT_DESCRIPTORS
+                    ):
+                        batches.append(batch)
+                        batch, size, descriptors = {}, 0, 0
+                    batch[key] = refs
+                    size += key_bytes
+                    descriptors += len(refs)
+                if batch:
                     batches.append(batch)
-                    batch, size, descriptors = {}, 0, 0
-                batch[key] = refs
-                size += key_bytes
-                descriptors += len(refs)
-            if batch:
-                batches.append(batch)
-        # Prepare before submitting: invalid pages cannot leave partial work.
-        # _progress serializes chunks and acknowledges the whole offload only
-        # after terminal completion, retaining all keys while DMA is uncertain.
-        return batches
+            # Prepare before submitting: invalid pages cannot leave partial work.
+            # _progress serializes chunks and acknowledges the whole offload only
+            # after terminal completion, retaining all keys while DMA is uncertain.
+            return batches
+        finally:
+            if timing is not None:
+                timing.observe("offload_mapping_seconds", time.perf_counter() - started)
 
     def _fail_batch(self, batch, error, *, fatal=False):
         batch.error = error
@@ -918,6 +1054,40 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             batch.completion.set_exception(error)
 
     def _progress(self):
+        timing = self._owner_timing
+        if timing is None:
+            return self._progress_impl()
+        started = time.perf_counter()
+        cpu_started = time.thread_time()
+        if self._last_progress_at is not None:
+            # End-to-next-start gap: commands, waits and logging, not poll work.
+            timing.observe(
+                "progress_service_gap_seconds", started - self._last_progress_at
+            )
+        try:
+            return self._progress_impl()
+        finally:
+            finished = time.perf_counter()
+            timing.observe("progress_wall_seconds", finished - started)
+            timing.observe("progress_cpu_seconds", time.thread_time() - cpu_started)
+            self._last_progress_at = finished
+            timing.log_stats()
+
+    def _timed_submit(self, function, *args, **kwargs):
+        timing = self._owner_timing
+        if timing is None:
+            return function(*args, **kwargs)
+        started = time.perf_counter()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            timing.observe(
+                "submission_seconds",
+                time.perf_counter() - started,
+                getattr(function, "__name__", type(function).__name__),
+            )
+
+    def _progress_impl(self):
         results = list(self._runtime.client.poll_completed())
         while self._runtime.events:
             event = self._runtime.events.popleft()
@@ -977,7 +1147,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     self._complete_layer(batch, layer)
                     continue
                 started = time.perf_counter()
-                handle = self._runtime.client.deliver(blocks, request_id=scope)
+                handle = self._timed_submit(
+                    self._runtime.client.deliver, blocks, request_id=scope
+                )
                 logger.debug(
                     "KVCR submission batch=%d layer=%d keys=%d cpu_ms=%.3f",
                     batch.index,
@@ -1039,7 +1211,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     if blocks is None:
                         task.exhausted = True
                     else:
-                        handle = self._runtime.client.deposit(blocks)
+                        handle = self._timed_submit(
+                            self._runtime.client.deposit, blocks
+                        )
                         self._operations[handle] = _Operation(task, set(blocks))
                         task.active += 1
             if task.exhausted and not task.active:

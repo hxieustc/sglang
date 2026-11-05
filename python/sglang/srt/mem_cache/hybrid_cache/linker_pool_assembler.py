@@ -549,6 +549,120 @@ def _build_mamba_swa_device_pool_group(
     return DevicePoolGroup(entries, num_layers + 1, page_size)
 
 
+def _build_qsa_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+    req_pool = params.req_to_token_pool
+    if get_memory().enable_unified_memory:
+        raise ValueError("QSA direct linker does not support unified memory.")
+    if not params.enable_mamba_extra_buffer:
+        raise ValueError("QSA direct linker requires Mamba extra-buffer checkpoints.")
+    if req_pool.mamba_ckpt_pool is not None:
+        raise ValueError("QSA direct linker does not support int8 checkpoints.")
+    if params.pp_size != 1 or params.attn_cp_size != 1 or kvcache.start_layer != 0:
+        raise ValueError("QSA direct linker requires PP1/CP1 and start_layer=0.")
+    if params.mtp_draft_mamba_pools:
+        raise ValueError("QSA direct linker does not support separate draft state.")
+    drafts = params.mtp_draft_device_pools
+    if len(drafts) > 1:
+        raise ValueError("QSA direct linker supports one full-attention MTP draft.")
+
+    kv_buffers, index_buffers = [], []
+    kv_mapping, index_mapping = {}, {}
+    ratio = kvcache.qsa_compress_ratio
+    if ratio <= 0 or page_size <= 1 or page_size % ratio:
+        raise ValueError("QSA direct linker pages must divide into compression groups.")
+    for pool in (kvcache, *drafts):
+        if type(pool) is not QSATokenToKVPool:
+            raise ValueError("QSA direct linker requires QSA target/draft pools.")
+        if pool.page_size != page_size or pool.qsa_compress_ratio != ratio:
+            raise ValueError("QSA target/draft page size and compress ratio must match.")
+        if pool.mamba_pool is not req_pool.mamba_pool:
+            raise ValueError("QSA direct linker requires shared target/draft state.")
+        full = pool.full_kv_pool
+        if type(full) is not MHATokenToKVPool or full.is_quantized_kv_cache:
+            raise ValueError("QSA direct linker requires MHA without scale buffers.")
+        if full.k_scale_buffer is not None or full.native_k_scale_buffer is not None:
+            raise ValueError("QSA direct linker does not support scale buffers.")
+        layers = pool.full_attention_layer_id_mapping
+        if pool is not kvcache and layers != {0: 0}:
+            raise ValueError("QSA direct linker requires one full-attention draft layer.")
+
+        # Page-row byte views support both NHD token rows and HND page rows.
+        # Never reshape a noncontiguous tensor into a detached copy.
+        for buffers, mapping, tensors, tokens_per_row in (
+            (kv_buffers, kv_mapping, full.k_buffer, full._kv_tokens_per_row()),
+            (kv_buffers, kv_mapping, full.v_buffer, full._kv_tokens_per_row()),
+            (index_buffers, index_mapping, pool.qsa_compressed_k_buffer_pool, 1),
+        ):
+            if len(tensors) != len(layers):
+                raise ValueError("QSA direct linker buffer/layer count mismatch.")
+            tokens_per_page = (
+                page_size // ratio if buffers is index_buffers else page_size
+            )
+            for layer, index in layers.items():
+                tensor = tensors[index]
+                span = tokens_per_page // tokens_per_row
+                if not tensor.is_contiguous() or tensor.shape[0] % span:
+                    raise ValueError(
+                        "QSA direct linker requires contiguous complete pages."
+                    )
+                # The draft is consumed after the target forward; attach it to
+                # gate zero even when target layer zero is linear attention.
+                gate = layer if pool is kvcache else 0
+                mapping[gate] = (*mapping.get(gate, ()), len(buffers))
+                buffers.append(
+                    tensor.view(torch.uint8).reshape(tensor.shape[0] // span, -1)
+                )
+
+    # These are the same checkpoint entries used by slot CoW / PD transfer:
+    # temporal + conv + all registered PLE windows and request-wide history.
+    # Speculative intermediates and ReplaySSM scratch are excluded by the pool.
+    state_buffers = [
+        tensor for _, tensor, _, _ in req_pool.mamba_pool._iter_transfer_state_entries()
+    ]
+    entries = [
+        DevicePoolEntry(
+            name=name,
+            indices_from_pool=source,
+            device_pool=pool,
+            components=[buffers],
+            layer_mapping=mapping,
+            page_size=entry_page_size,
+            rows_are_pages=True,
+        )
+        for name, source, pool, buffers, mapping, entry_page_size in (
+            (PoolName.KV, PoolName.KV, kvcache, kv_buffers, kv_mapping, page_size),
+            (
+                PoolName.INDEXER,
+                PoolName.KV,
+                kvcache,
+                index_buffers,
+                index_mapping,
+                page_size,
+            ),
+            # Load the whole slot at gate zero. N-gram history is read before
+            # the decoder loop, and CoW must include PLE on late full layers.
+            (
+                PoolName.MAMBA,
+                PoolName.MAMBA,
+                req_pool.mamba_pool,
+                state_buffers,
+                {0: tuple(range(len(state_buffers)))},
+                1,
+            ),
+        )
+    ]
+    # A reusable prefix ends at a whole page, hence at a compression-group
+    # boundary. No pending QSA key/RoPE members precede the resumed group;
+    # the request ring is rebuilt by subsequent forward tokens, not persisted.
+    num_layers = max(*kv_mapping, *req_pool.mamba_map) + 1
+    return DevicePoolGroup(entries, num_layers, page_size)
+
+
 def _build_mha_device_pool_group(
     kvcache: Any,
     page_size: int,

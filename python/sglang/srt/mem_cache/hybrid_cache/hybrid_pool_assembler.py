@@ -1952,6 +1952,18 @@ class _DeepSeekV4Strategy(StackStrategy):
 
 
 class _MambaStrategy(StackStrategy):
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_qsa_device_pool_group,
+        )
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+        if type(kvcache) is not QSATokenToKVPool:
+            return super().build_direct_linker_pool_group(
+                kvcache=kvcache, params=params, page_size=page_size
+            )
+        return _build_qsa_device_pool_group(kvcache, params, page_size)
+
     def matches(self, kvcache, components):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 

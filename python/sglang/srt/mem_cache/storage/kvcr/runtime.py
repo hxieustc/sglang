@@ -12,6 +12,73 @@ from collections import Counter, deque
 logger = logging.getLogger(__name__)
 
 
+def _pool_lengths(layout, capacity, divisor, mamba_checkpoint_capacity=None):
+    """Pool byte lengths, reserving complete checkpoints before token pages.
+
+    Explicit checkpoint sizing supports non-trailing KV/indexer/Mamba layouts.
+    Without it, retain the legacy complete-page and SWA divisor calculation.
+    """
+    if type(divisor) is not int or divisor < 1:
+        raise ValueError("KVCR trailing_capacity_divisor must be a positive integer")
+    checkpoint_bytes = 0
+    if mamba_checkpoint_capacity is not None:
+        if type(mamba_checkpoint_capacity) is not int or mamba_checkpoint_capacity < 1:
+            raise ValueError("KVCR mamba_checkpoint_capacity must be a positive integer")
+        entries = {entry.name: entry for entry in layout.group.entries}
+        families = {name.partition("_")[0] for name, _ in layout.pool_layouts}
+        if (
+            not {"kv", "mamba"} <= entries.keys() <= {"kv", "indexer", "mamba"}
+            or families != entries.keys()
+            or any(layout.trailing_counts.values())
+            or any(
+                entry.indices_from_pool != ("kv" if name == "indexer" else name)
+                or entry.page_size != (1 if name == "mamba" else entries["kv"].page_size)
+                for name, entry in entries.items()
+            )
+        ):
+            raise ValueError(
+                "KVCR explicit Mamba capacity requires KV/indexer/Mamba topology"
+            )
+        checkpoint_bytes = (
+            sum(
+                size * layout.pool_counts[name]
+                for name, size in layout.pool_layouts
+                if name.startswith("mamba_")
+            )
+            * mamba_checkpoint_capacity
+        )
+    remaining = capacity - checkpoint_bytes
+    budgeted_pools = [
+        (name, size)
+        for name, size in layout.pool_layouts
+        if mamba_checkpoint_capacity is None or not name.startswith("mamba_")
+    ]
+    full_bytes = sum(
+        size * (layout.pool_counts[name] - layout.trailing_counts[name])
+        for name, size in budgeted_pools
+    )
+    trailing_bytes = sum(
+        size * layout.trailing_counts[name] for name, size in budgeted_pools
+    )
+    if remaining < full_bytes + trailing_bytes:
+        raise ValueError("KVCR DRAM capacity must fit at least one complete page")
+    page_count = remaining * divisor // (full_bytes * divisor + trailing_bytes)
+    if full_bytes:
+        # Even a large divisor must leave room for one full trailing page.
+        page_count = min(page_count, (remaining - trailing_bytes) // full_bytes)
+    trailing_pages = max(1, page_count // divisor)
+    return [
+        size
+        * (
+            mamba_checkpoint_capacity * layout.pool_counts[name]
+            if mamba_checkpoint_capacity is not None and name.startswith("mamba_")
+            else page_count * (layout.pool_counts[name] - layout.trailing_counts[name])
+            + trailing_pages * layout.trailing_counts[name]
+        )
+        for name, size in layout.pool_layouts
+    ]
+
+
 class _TelemetryStats:
     """Bounded interval aggregates recorded on the KVCR API owner thread."""
 
@@ -64,6 +131,8 @@ class KVCRRuntime:
             "startup_timeout_seconds": None,
             "enable_telemetry": False,
             "trailing_capacity_divisor": 1,
+            "mamba_checkpoint_capacity": None,
+            "residency_log_path": None,
         }
         unknown = options.keys() - defaults.keys()
         if unknown:
@@ -93,26 +162,14 @@ class KVCRRuntime:
             or size_gb <= 0
         ):
             raise ValueError("KVCR dram_size_gb must be finite and positive")
-        divisor = config["trailing_capacity_divisor"]
-        if type(divisor) is not int or divisor < 1:
-            raise ValueError(
-                "KVCR trailing_capacity_divisor must be a positive integer"
-            )
-        full_bytes = sum(
-            size * (layout.pool_counts[name] - layout.trailing_counts[name])
-            for name, size in layout.pool_layouts
+        if config["mamba_checkpoint_capacity"] is not None and guard_socket is not None:
+            raise ValueError("KVCR mamba_checkpoint_capacity requires process-local DRAM")
+        pool_lengths = _pool_lengths(
+            layout,
+            int(size_gb * (1 << 30)),
+            config["trailing_capacity_divisor"],
+            config["mamba_checkpoint_capacity"],
         )
-        trailing_bytes = sum(
-            size * layout.trailing_counts[name] for name, size in layout.pool_layouts
-        )
-        capacity = int(size_gb * (1 << 30))
-        if capacity < full_bytes + trailing_bytes:
-            raise ValueError("KVCR DRAM capacity must fit at least one complete page")
-        page_count = capacity * divisor // (full_bytes * divisor + trailing_bytes)
-        if full_bytes:
-            # Even a large divisor must leave room for one full trailing page.
-            page_count = min(page_count, (capacity - trailing_bytes) // full_bytes)
-        trailing_pages = max(1, page_count // divisor)
         for name in ("control_port", "nixl_port"):
             port = config[name]
             if type(port) is not int or not 1 <= port + rank <= 65535:
@@ -155,15 +212,28 @@ class KVCRRuntime:
         self.client = None
         self.process_local = False
 
+        self._residency_observer = None
+        if config["residency_log_path"] is not None:
+            from residency_observer import ResidencyObserver
+
+            self._residency_observer = ResidencyObserver(
+                layout, config["residency_log_path"], rank
+            )
+
         def inventory(event):
             if event.tier is CacheTier.LOCAL_G2:
+                observed = []
                 for key in event.keys:
                     decoded = layout.decode_key(key)
                     if decoded is not None:
+                        if self._residency_observer is not None:
+                            observed.append((key, decoded[0].value))
                         if event.removed:
                             self.removals[key] = decoded[1]
                         else:
                             self.removals.pop(key, None)
+                if self._residency_observer is not None:
+                    self._residency_observer.inventory(event, observed)
 
         try:
             kvcr_config = KVCRConfig(
@@ -221,12 +291,7 @@ class KVCRRuntime:
                         raise
                     logger.warning("%s; using in-process KVCR DRAM", error)
             pools = []
-            for name, size in layout.pool_layouts:
-                length = (
-                    page_count
-                    * (layout.pool_counts[name] - layout.trailing_counts[name])
-                    + trailing_pages * layout.trailing_counts[name]
-                ) * size
+            for (name, _), length in zip(layout.pool_layouts, pool_lengths):
                 buffer = mmap.mmap(-1, length)
                 self._buffers.append(buffer)
                 address = ctypes.addressof(ctypes.c_char.from_buffer(buffer))
@@ -279,6 +344,8 @@ class KVCRRuntime:
             return
         self._last_stats_log = now
         try:
+            if self._residency_observer is not None:
+                self._residency_observer.pools(self.client)
             stats = self.client.get_stats()
             if stats is not None and not stats.is_empty():
                 logger.info(
@@ -299,6 +366,8 @@ class KVCRRuntime:
             raise RuntimeError("KVCR startup did not establish safe resource ownership")
         self.log_stats(force=True)
         self.client.close()
+        if self._residency_observer is not None:
+            self._residency_observer.close()
         self._close_buffers()
 
     def _close_buffers(self) -> None:
