@@ -681,6 +681,20 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         if not hit_pages:
             self._discard_lookup(scope)
             return False
+        if not self._shard and keys:
+            claims = self._lookup_claims.get(scope, {})
+            for transfer in prepared:
+                if transfer.hit_policy != PoolHitPolicy.ALL_PAGES:
+                    continue
+                first = self.layout.encode_key(keys[0], transfer.name)
+                if first in claims and claims[first] is None:
+                    # Every positive candidate requires this page. Avoid
+                    # rebuilding all shorter windows after a known miss.
+                    self._release_claims(
+                        [claim for claim in claims.values() if claim is not None]
+                    )
+                    self._lookup_claims[scope] = {first: None}
+                    return False
         windows = {
             t.name: [
                 self.layout.encode_key(key, t.name)
