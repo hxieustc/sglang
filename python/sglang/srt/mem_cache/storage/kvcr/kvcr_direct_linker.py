@@ -423,6 +423,9 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._scopes = {}
         self._request_scopes = {}
         self._lookup_claims = {}
+        self._lookup_plans = {}
+        self._lookup_generation = 0
+        self._confirmation_state = {}
         self._released_scopes = set()
         self._gc_frozen = False
         self._fatal = None
@@ -622,7 +625,11 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         return self._call(self._lookup, rid, keys, prepared)
 
     def _lookup(self, rid, keys, prepared):
-        self._discard_lookup(self._request_scopes.get(rid))
+        # A fresh lookup supersedes this scope's previous encoding generation.
+        self._lookup_generation += 1
+        scope = self._request_scopes.get(rid)
+        self._discard_lookup(scope)
+        vectors = {}
         valid = set(range(1, len(keys) + 1))
         for transfer in prepared:
             encoded = [self.layout.encode_key(key, transfer.name) for key in keys]
@@ -631,6 +638,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             )
             if len(result) != len(encoded):
                 raise RuntimeError("KVCR query returned an incomplete result")
+            if not self._shard:
+                vectors[transfer.name] = tuple(encoded)
             hits = [
                 (status.value, tier.value if tier is not None else None)
                 in (("HIT", "DRAM"), ("FETCHABLE", "REMOTE_G2"))
@@ -655,7 +664,42 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     else max(0, end - window)
                 ]
             }
+        signature = self._lookup_signature(prepared) if not self._shard else None
+        # Encodings only: _lookup_claims remains the sole claim/lease owner.
+        if scope is not None and signature is not None:
+            self._lookup_plans[scope] = (
+                self._lookup_generation, keys, self.layout, signature, vectors,
+                len(vectors) == len(prepared) and len({key for vector in vectors.values() for key in vector})
+                == sum(len(vector) for vector in vectors.values()),
+            )
         return sorted(valid)
+
+    def _lookup_signature(self, prepared):
+        if any(
+            t.hit_policy not in (PoolHitPolicy.ALL_PAGES, PoolHitPolicy.TRAILING_PAGES)
+            or t.name not in self.layout._labels
+            for t in prepared
+        ):
+            return None
+        return self.layout._key_prefix, tuple(
+            (
+                t.name, t.hit_policy, max(1, len(t.keys)),
+                tuple(tuple(labels) for labels in self.layout._labels[t.name]),
+            )
+            for t in prepared
+        )
+
+    def _lookup_encodings(self, scope, keys, prepared):
+        plan = self._lookup_plans.get(scope)
+        if plan is None:
+            return None
+        if (
+            not self._shard and plan[1] == keys and plan[2] is self.layout
+            and plan[3] == self._lookup_signature(prepared)
+        ):
+            return plan[4]
+        self._lookup_plans.pop(scope, None)
+        return None
 
     def _release_claims(self, claims):
         if claims:
@@ -664,6 +708,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                 raise RuntimeError("KVCR claim release failed")
 
     def _discard_lookup(self, scope):
+        self._confirmation_state.pop(scope, None)
+        self._lookup_plans.pop(scope, None)
         claims = self._lookup_claims.get(scope, {})
         self._release_claims([claim for claim in claims.values() if claim is not None])
         self._lookup_claims.pop(scope, None)
@@ -678,15 +724,36 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         if self._owner_timing is not None and hit_pages:
             self._owner_timing.observe("confirmation_candidates", 1)
         scope = self._request_scopes.get(rid)
+        state = self._confirmation_state.pop(scope, None)
+        try:
+            if hit_pages:
+                self._lookup_encodings(scope, keys, prepared)
+                plan = self._lookup_plans.get(scope)
+                claims = self._lookup_claims.get(scope)
+                if (state is not None and state[0] is plan and state[2] == id(claims)
+                        and 0 < hit_pages < state[1] <= len(keys)):
+                    return self._confirm_lookup_delta(scope, prepared, hit_pages, state, claims)
+            return self._confirm_lookup_full(rid, keys, prepared, hit_pages)
+        except BaseException:
+            self._confirmation_state.pop(scope, None)
+            self._lookup_plans.pop(scope, None)
+            raise
+
+    def _confirm_lookup_full(self, rid, keys, prepared, hit_pages):
+        scope = self._request_scopes.get(rid)
         if not hit_pages:
             self._discard_lookup(scope)
             return False
+        vectors = self._lookup_encodings(scope, keys, prepared)
         if not self._shard and keys:
             claims = self._lookup_claims.get(scope, {})
             for transfer in prepared:
                 if transfer.hit_policy != PoolHitPolicy.ALL_PAGES:
                     continue
-                first = self.layout.encode_key(keys[0], transfer.name)
+                first = (
+                    vectors[transfer.name][0] if vectors is not None
+                    else self.layout.encode_key(keys[0], transfer.name)
+                )
                 if first in claims and claims[first] is None:
                     # Every positive candidate requires this page. Avoid
                     # rebuilding all shorter windows after a known miss.
@@ -696,7 +763,10 @@ class KVCRDirectLinker(UnifiedCacheLinker):
                     self._lookup_claims[scope] = {first: None}
                     return False
         windows = {
-            t.name: [
+            t.name: vectors[t.name][
+                (0 if t.hit_policy == PoolHitPolicy.ALL_PAGES
+                 else max(0, hit_pages - max(1, len(t.keys)))) : hit_pages
+            ] if vectors is not None else [
                 self.layout.encode_key(key, t.name)
                 for key in keys[
                     (
@@ -741,7 +811,60 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         while owner.active:
             self._progress()
             time.sleep(0)
+        self._confirm_lookup_learn(scope, prepared, hit_pages, windows, required, claims)
         return all(claims.get(key) is not None for key in required)
+
+    def _confirm_lookup_learn(self, scope, prepared, hit_pages, windows, required, claims):
+        plan = self._lookup_plans.get(scope)
+        if (plan is None or not plan[5] or self._shard or not 0 < hit_pages <= len(plan[1])
+                or not any(t.hit_policy == PoolHitPolicy.ALL_PAGES for t in prepared)):
+            return
+        if any(isinstance(op.owner, _Confirm) and op.owner.claims is claims
+               for op in self._operations.values()):
+            return
+        if all(claims.get(key) is not None for t in prepared
+               if t.hit_policy == PoolHitPolicy.ALL_PAGES for key in windows[t.name]):
+            self._confirmation_state[scope] = (plan, hit_pages, id(claims), required)
+
+    def _confirm_lookup_delta(self, scope, prepared, hit_pages, state, claims):
+        plan, previous, _, required = state
+        windows = {}
+        for t in prepared:
+            vector = plan[4][t.name]
+            old_start = 0 if t.hit_policy == PoolHitPolicy.ALL_PAGES else max(0, previous - max(1, len(t.keys)))
+            start = 0 if t.hit_policy == PoolHitPolicy.ALL_PAGES else max(0, hit_pages - max(1, len(t.keys)))
+            leaving = vector[max(hit_pages, old_start):previous]
+            entering = vector[start:min(old_start, hit_pages)]
+            required.difference_update(leaving)
+            required.update(entering)
+            if t.hit_policy != PoolHitPolicy.ALL_PAGES:
+                windows[t.name] = vector[start:hit_pages]
+        # Keep A's exact set-difference ordering for release callbacks. This
+        # intentionally retains one full-keyset operation; all prefix scans below
+        # are avoided by the live-claim proof learned after normal completion.
+        stale = claims.keys() - required
+        self._release_claims([claims[key] for key in stale if claims[key] is not None])
+        for key in stale:
+            del claims[key]
+        if any(key in claims and claims[key] is None for window in windows.values() for key in window):
+            self._confirmation_state[scope] = (plan, hit_pages, id(claims), required)
+            return False
+        owner = _Confirm(claims)
+        for name, window in windows.items():
+            # Scan the entire trailing window, including retained keys never
+            # submitted because an earlier candidate returned on a cached None.
+            pending = [key for key in window if key not in claims]
+            if not pending:
+                continue
+            labels = [label for component in self.layout._labels[name] for label in component]
+            handle = self._runtime.client.fetch(pending, request_id=scope, expected_layout=labels)
+            self._operations[handle] = _Operation(owner, set(pending))
+            owner.active += 1
+        while owner.active:
+            self._progress()
+            time.sleep(0)
+        self._confirmation_state[scope] = (plan, hit_pages, id(claims), required)
+        return all(claims.get(key) is not None for window in windows.values() for key in window)
 
     def load(self, rid, transfers):
         prepared = self.layout.prepare(
@@ -763,6 +886,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             return False
         if rid in self._loads:
             raise RuntimeError(f"KVCR load already accepted for {rid}")
+        self._confirmation_state.pop(scope, None)
+        self._lookup_plans.pop(scope, None)
         claims = self._lookup_claims.pop(scope, {})
         load = _Load(
             rid,
@@ -1280,6 +1405,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         self._gather_loads.clear()
 
     def _reset(self):
+        self._confirmation_state.clear()
+        self._lookup_plans.clear()
         self._runtime.close()
         removals = self._runtime.removals
         for batch in self._batches:
@@ -1312,6 +1439,8 @@ class KVCRDirectLinker(UnifiedCacheLinker):
             self._thread.join()
 
     def _close(self):
+        self._confirmation_state.clear()
+        self._lookup_plans.clear()
         self._runtime.close()
         self._lookup_claims.clear()
         for batch in self._batches:
