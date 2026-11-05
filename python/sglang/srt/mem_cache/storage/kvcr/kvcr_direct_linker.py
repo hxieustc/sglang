@@ -7,7 +7,10 @@ import gc
 import hashlib
 import json
 import logging
+import math
+import os
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -322,6 +325,18 @@ class KVCRDirectLinker(UnifiedCacheLinker):
         profile_owner = options.pop("profile_owner", False)
         if type(profile_owner) is not bool:
             raise ValueError("KVCR profile_owner must be a boolean")
+        if "python_gil_switch_interval_seconds" in options:
+            interval = options.pop("python_gil_switch_interval_seconds")
+            if type(interval) not in (int, float) or not math.isfinite(interval) or interval <= 0:
+                raise ValueError(
+                    "KVCR python_gil_switch_interval_seconds must be finite and positive"
+                )
+            before = sys.getswitchinterval()
+            sys.setswitchinterval(interval)
+            logger.info(
+                "KVCR Python GIL switch interval pid=%s rank=%s before=%s actual=%s",
+                os.getpid(), rank, before, sys.getswitchinterval(),
+            )
         self._timing_rank = rank
         self._owner_timing = _OwnerTiming(rank, "owner") if profile_owner else None
         self._caller_timing = threading.local() if profile_owner else None
