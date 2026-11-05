@@ -16,11 +16,13 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
-from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.fp4_utils import (
+    fp4_quantize,
+    get_fp4_gemm_runner_backend,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     enable_flashinfer_fp4_gemm,
     fp4_gemm,
-    fp4_quantize,
 )
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
 
@@ -151,10 +153,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
 
         w = layer.weight_packed
         w_blockscale = layer.weight_scale
-        if (
-            enable_flashinfer_fp4_gemm
-            and not get_fp4_gemm_runner_backend().is_cutlass()
-        ):
+        if enable_flashinfer_fp4_gemm:
             w = layer.weight_packed.T
             w_blockscale = layer.weight_scale.T
 

@@ -3,8 +3,9 @@ import re
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.midashenglm import MiDashengLMModel
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -48,7 +49,13 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             self.FEATURE_NAMES.append("input_values")
 
     def process_mm_data(
-        self, input_text, images=None, videos=None, audios=None, **kwargs
+        self,
+        input_text,
+        images=None,
+        videos=None,
+        audios=None,
+        processor=None,
+        **kwargs,
     ):
         """Override to use correct audio parameter name for MiDashengLM processor."""
         if images:
@@ -62,7 +69,9 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             if self.audio_config:
                 kwargs["audio_kwargs"].update(self.audio_config)
 
-        processor = self._processor
+        # Take the worker pool's per-thread clone when it hands one over; falling
+        # back to self._processor would put every worker on one shared object.
+        processor, _ = self._resolve_processor(processor)
         result = processor.__call__(
             text=[input_text],
             padding=True,
@@ -70,7 +79,7 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             **kwargs,
         )
 
-        if not getattr(self.server_args, "keep_mm_feature_on_device", False):
+        if not self.use_cuda_ipc:
             for feature_name in ["input_values"]:
                 if feature_name in result:
                     result[feature_name] = result[feature_name].cpu()
@@ -112,7 +121,7 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             logger.info("base_output is None")
             return None
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
         logger.info(f"mm_items count: {len(mm_items)}")

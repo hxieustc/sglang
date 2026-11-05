@@ -16,13 +16,18 @@
 This package provides HF Transformers helpers, split into submodules
 (common, config, tokenizer, processor, mistral_utils).  Compatibility
 monkey-patches live in the sibling ``sglang.srt.utils.hf_transformers_patches``
-module and are applied at sglang import time.
-All public symbols are re-exported here for convenience.  The old import
-path ``sglang.srt.utils.hf_transformers_utils`` is preserved by a
-separate shim module.
+module and are applied when this package is imported, before anything here
+loads a config, tokenizer, or processor.
+All public symbols are re-exported here for convenience.
 """
 
-from ..hf_transformers_patches import normalize_rope_scaling_compat
+from ..hf_transformers_patches import (
+    apply_all_hf_patches,
+    normalize_rope_scaling_compat,
+)
+
+apply_all_hf_patches()
+
 from .common import (
     CONTEXT_LENGTH_KEYS,
     AutoConfig,
@@ -35,9 +40,10 @@ from .common import (
     get_rope_config,
     get_sparse_attention_config,
     get_tokenizer_from_processor,
+    resolve_hf_gguf_reference,
 )
 from .config import get_config
-from .processor import get_processor
+from .processor import get_processor, resolve_image_processor_backend
 from .tokenizer import (
     _fix_added_tokens_encoding,
     _fix_v5_add_bos_eos_token,
@@ -51,12 +57,14 @@ __all__ = [
     "_fix_v5_add_bos_eos_token",
     "attach_additional_stop_token_ids",
     "check_gguf_file",
+    "resolve_hf_gguf_reference",
     "download_from_hf",
     "get_config",
     "get_context_length",
     "get_generation_config",
     "get_hf_text_config",
     "get_processor",
+    "resolve_image_processor_backend",
     "get_rope_config",
     "get_sparse_attention_config",
     "get_tokenizer",

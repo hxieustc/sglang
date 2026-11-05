@@ -26,15 +26,16 @@ if TYPE_CHECKING:
 
 
 class BaseCudaGraphBackend(ABC):
-    """Pure ABC: no state, no defaults. Each implementation owns its
-    per-backend state and binds the handles it needs from the
+    """Device lifecycle and optional hooks with portable defaults.
+
+    Each implementation owns its per-backend state and binds handles from the
     cuda_graph_runner passed to its __init__.
 
     Methods:
       - capture_session(stream) — context wrapping the runner's outer
         capture loop; backends bind stream / pool and open per-backend
         capture flags here.
-      - capture_one(shape_key, forward_fn, dummies, post_warmup_hook)
+      - capture_one(shape_key, forward_fn, capture_inputs, post_warmup_hook)
         — record the replayable artifact for shape_key; one call per
         shape inside capture_session.
       - can_run(forward_batch, shape_key) — can this backend replay
@@ -49,7 +50,42 @@ class BaseCudaGraphBackend(ABC):
     Notes:
       - The outer capture loop is runner-specific; it lives on the
         runner, not here.
+      - capture_inputs optionally carries capture-time input owners that a
+        backend must retain when its graph records their tensor addresses.
     """
+
+    @property
+    def supports_shared_read_events(self) -> bool:
+        """Whether the runner publishes shared-buffer read completion events."""
+        return True
+
+    @property
+    def cache_loc_dtype(self) -> torch.dtype:
+        return torch.int64
+
+    def prepare_replay(self, forward_batch: ForwardBatch) -> bool:
+        """Whether device-specific replay input preparation is complete."""
+        return False
+
+    def prepare_capture_forward(self, model, enable_compile, **kwargs):
+        """Yield the capture forward callable; restore temporary state on exit."""
+        from sglang.srt.compilation import torch_compile_decoration
+
+        return torch_compile_decoration.patch_model(model, enable_compile, **kwargs)
+
+    def capture_profile_context(self, options):
+        from sglang.srt.model_executor.runner_backend.capture_profile import (
+            create_cuda_capture_profile,
+        )
+
+        return create_cuda_capture_profile(options)
+
+    def finish_capture_profile(self, options, profile_context) -> None:
+        from sglang.srt.model_executor.runner_backend.capture_profile import (
+            finish_cuda_capture_profile,
+        )
+
+        finish_cuda_capture_profile(options, profile_context)
 
     @abstractmethod
     def capture_session(self, stream: torch.cuda.Stream) -> Iterator[None]: ...
@@ -59,7 +95,7 @@ class BaseCudaGraphBackend(ABC):
         self,
         shape_key: ShapeKey,
         forward_fn,
-        dummies: Optional[Any] = None,
+        capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None: ...
 

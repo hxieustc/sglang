@@ -1,7 +1,4 @@
-"""Copy of upstream flashinfer-trtllm FP8 MoE dispatch, wired to experimental_sgl_trtllm_moe
-block-scale wrappers (LoRA-capable) so moe_runner/flashinfer_trtllm.py stays pristine. Body is
-verbatim from upstream; helper imports are call-time (cycle-safe); two FP8 wrappers shadowed.
-"""
+"""FP8 MoE dispatch using LoRA-capable block-scale wrappers."""
 
 from __future__ import annotations
 
@@ -30,15 +27,17 @@ def fused_experts_fp8_sgl(
     # <-> quantization import cycle at load time.
     from flashinfer.fused_moe import Fp8QuantizationType
 
-    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-        _pack_topk_for_flashinfer_routed,
-        get_tp_group,
-        is_allocation_symmetric,
-        next_power_of_2,
+    from sglang.kernels.ops.lora.moe.trtllm_lora_temp.topk_pack import fused_pack_topk
+    from sglang.kernels.ops.quantization.fp8_kernel import (
         per_token_group_quant_fp8,
         scaled_fp8_quant,
-        trtllm_fp8_per_tensor_scale_moe_wrapper,
+    )
+    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         use_symmetric_memory,
+    )
+    from sglang.srt.layers.dp_attention import is_allocation_symmetric
+    from sglang.srt.layers.moe.flashinfer_trtllm_moe import (
+        trtllm_fp8_per_tensor_scale_moe_wrapper,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
@@ -49,6 +48,8 @@ def fused_experts_fp8_sgl(
     from sglang.srt.lora.trtllm_lora_temp.experimental_sgl_trtllm_moe import (
         sgl_trtllm_fp8_block_scale_routed_moe_wrapper as trtllm_fp8_block_scale_routed_moe_wrapper,
     )
+    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.utils.common import next_power_of_2
 
     _SUPPORTED_FP8_ACTIVATIONS = {"silu", "relu2"}
     assert runner_config.activation in _SUPPORTED_FP8_ACTIVATIONS, (
@@ -101,7 +102,7 @@ def fused_experts_fp8_sgl(
 
         # Allocate output inside symmetric memory context
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             symm_output = torch.empty(
                 hidden_states.shape[0],
@@ -114,11 +115,11 @@ def fused_experts_fp8_sgl(
         # during torch.compile for piecewise cuda graph.
         # Use custom op wrapper for torch.compile compatibility.
         if use_routed_topk:
-            assert (
-                runner_config.top_k is not None
-            ), "runner_config.top_k is required for flashinfer_trtllm_routed."
+            assert runner_config.top_k is not None, (
+                "runner_config.top_k is required for flashinfer_trtllm_routed."
+            )
             assert TopKOutputChecker.format_is_standard(topk_output)
-            packed_topk_ids = _pack_topk_for_flashinfer_routed(
+            packed_topk_ids = fused_pack_topk(
                 topk_ids=topk_output.topk_ids,
                 topk_weights=topk_output.topk_weights,
             )
@@ -201,7 +202,7 @@ def fused_experts_fp8_sgl(
 
         # Allocate output inside symmetric memory context
         with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
         ):
             symm_output = torch.empty(
                 hidden_states.shape[0],

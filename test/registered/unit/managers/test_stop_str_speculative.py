@@ -12,13 +12,15 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 # Token id -> decoded text; decode() concatenates. Distinct symbols so no
 # accidental cross-matches (10-39 are lowercase letters).
 STOP_ID = 1
+EOS_ID = 2
 ID_TO_TEXT = {
     STOP_ID: "STOP",
+    EOS_ID: "",
     **{i: chr(ord("a") + i % 26) for i in range(10, 40)},
     60: "a",
     61: ".",
@@ -48,7 +50,7 @@ class _MockTokenizerForNormalize:
         return list(range(len(s)))  # One "token" per character
 
 
-def _make_req(output_ids, stop=None, stop_regex=None):
+def _make_req(output_ids, stop=None, stop_regex=None, eos_token_ids=frozenset()):
     sp = SamplingParams(max_new_tokens=1000, stop=stop, stop_regex=stop_regex)
     sp.normalize(tokenizer=_MockTokenizerForNormalize())  # char-based stop_str_max_len
     req = Req(
@@ -56,7 +58,7 @@ def _make_req(output_ids, stop=None, stop_regex=None):
         origin_input_text="",
         origin_input_ids=array("q", [0]),
         sampling_params=sp,
-        eos_token_ids=set(),
+        eos_token_ids=eos_token_ids,
         vocab_size=10_000,
     )
     req.tokenizer = _FakeTokenizer()
@@ -79,6 +81,18 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertTrue(req.finished())
         self.assertEqual(req.finished_reason.matched, "STOP")
         self.assertEqual(req.finished_len, 4)
+
+    def test_stop_str_wins_over_eos_in_same_step(self):
+        # A step accepting both the stop string and EOS must finish as
+        # FINISH_MATCHED_STR with finished_len past the stop string, not as
+        # FINISH_MATCHED_TOKEN trimming only the EOS token (which leaks "STOP").
+        req = _make_req(
+            [10, 11, STOP_ID, EOS_ID], stop=["STOP"], eos_token_ids={EOS_ID}
+        )
+        req.update_finish_state(new_accepted_len=4)
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.matched, "STOP")
+        self.assertEqual(req.finished_len, 3)
 
     def test_stop_str_at_chunk_end_uses_full_len(self):
         # Stop is the last token -> loop never matches before the full window ->
@@ -122,15 +136,14 @@ class TestStopStrSpeculative(unittest.TestCase):
         self.assertEqual(req.finished_reason.matched, r"\.$")
         self.assertEqual(req.finished_len, 2)
 
-    # --- decoded_text-only branch ---
-    def test_stop_str_only_in_decoded_text_sets_no_finished_len(self):
-        # Documents current behavior: when the stop is only in decoded_text (not
-        # the tail), the request finishes but finished_len is left unset.
-        req = _make_req([10, 11, 12], stop=["STOP"])  # no STOP in output tokens
-        req.decoded_text = "earlier STOP text"
+    def test_stop_regex_end_anchored_midchunk(self):
+        """An end-anchored stop_regex that matches only after a token accepted
+        mid-step ("a." in "a.b") must still finish the request."""
+        req = _make_req([60, 61, 62], stop_regex=[r"[.!?]\s*$"])
         req.update_finish_state(new_accepted_len=3)
         self.assertTrue(req.finished())
-        self.assertIsNone(req.finished_len)
+        self.assertEqual(req.finished_reason.matched, r"[.!?]\s*$")
+        self.assertEqual(req.finished_len, 2)
 
 
 if __name__ == "__main__":

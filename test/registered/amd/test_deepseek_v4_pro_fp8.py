@@ -38,26 +38,12 @@ DEEPSEEK_V4_PRO_FP8_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = 5400
 FLASHMLA_BACKEND = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "unified_kv_triton")
 
-# Common DeepSeek-V4 env vars (AMD ROCm 7.2 path: AITER indexer + triton attn + ROCm700A).
 COMMON_ENV_VARS = {
     "SGLANG_DEFAULT_THINKING": "1",
     "SGLANG_DSV4_REASONING_EFFORT": "max",
-    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "false",
-    "SGLANG_USE_AITER": "1",
-    "SGLANG_USE_ROCM700A": "1",
-    "SGLANG_OPT_USE_FUSED_COMPRESS": "true",
-    "SGLANG_OPT_USE_FUSED_COMPRESS_TRITON": "true",
+    "SGLANG_USE_ROCM700A": "0",
+    "SGLANG_DP_USE_GATHERV": "1",
     "SGLANG_HACK_FLASHMLA_BACKEND": FLASHMLA_BACKEND,
-    "SGLANG_OPT_FP8_WO_A_GEMM": "false",
-    "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "false",
-    "SGLANG_OPT_USE_TOPK_V2": "false",
-    "SGLANG_OPT_USE_AITER_INDEXER": "true",
-    "SGLANG_OPT_USE_TILELANG_INDEXER": "false",
-    "SGLANG_OPT_USE_TILELANG_MHC_PRE": "false",
-    "SGLANG_OPT_USE_TILELANG_MHC_POST": "false",
-    "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH": "1",
-    "SGLANG_OPT_USE_MULTI_STREAM_OVERLAP": "false",
-    "SGLANG_ROCM_USE_MULTI_STREAM": "false",
     "AITER_BF16_FP8_MOE_BOUND": "0",
 }
 
@@ -121,7 +107,7 @@ class TestDeepseekV4ProFp8(CustomTestCase):
             num_questions=1319,
             parallel=1319,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)
@@ -148,7 +134,7 @@ class TestDeepseekV4ProFp8(CustomTestCase):
         cmd = [
             "python3",
             "-m",
-            "sglang.bench_one_batch_server",
+            "sglang.benchmark.one_batch_server",
             "--model",
             "None",
             "--base-url",

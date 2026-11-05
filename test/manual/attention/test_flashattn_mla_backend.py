@@ -7,11 +7,12 @@ from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBac
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     set_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -49,6 +50,7 @@ class MockModelRunner:
             },
         )
         self.kv_cache_dtype = self.server_args.kv_cache_dtype
+        self.kv_cache_dtype_str = "auto"
 
         batch_size = 160
         # Create a proper req_to_token_pool with the req_to_token attribute
@@ -190,15 +192,11 @@ class TestFlashAttentionMLABackend(CustomTestCase):
                 extend_prefix_lens=torch.tensor(
                     [prefix_len] * self.batch_size, device=self.device
                 ),
-                extend_prefix_lens_cpu=torch.tensor(
-                    [prefix_len] * self.batch_size, device="cpu"
-                ),
+                extend_prefix_lens_cpu=[prefix_len] * self.batch_size,
                 extend_seq_lens=torch.tensor(
                     [q_len] * self.batch_size, device=self.device
                 ),
-                extend_seq_lens_cpu=torch.tensor(
-                    [q_len] * self.batch_size, device="cpu"
-                ),
+                extend_seq_lens_cpu=[q_len] * self.batch_size,
             )
 
         else:  # ForwardMode.DECODE

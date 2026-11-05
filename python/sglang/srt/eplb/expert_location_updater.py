@@ -21,19 +21,25 @@ import torch.distributed
 from torch.distributed import P2POp
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
+from sglang.srt.runtime_context import get_device
+from sglang.srt.utils import get_bool_env_var, is_npu
+
+_is_npu = is_npu()
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.eplb import (
+        update_expert_weights_with_staging,
+    )
+
 
 logger = logging.getLogger(__name__)
 
 
 _LOG_INPUT = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT")
-
-_is_hip = is_hip()
 
 
 class ExpertLocationUpdater:
@@ -47,6 +53,7 @@ class ExpertLocationUpdater:
         update_layer_ids: List[int],
         nnodes: int,
         rank: int,
+        use_flat_topology: bool = False,
     ):
         """
         Update experts' physical location after EPLB.
@@ -60,13 +67,14 @@ class ExpertLocationUpdater:
 
         old_expert_location_metadata = get_global_expert_location_metadata()
         assert old_expert_location_metadata is not None
+        topology_num_nodes = 1 if use_flat_topology else nnodes
 
         missing_logical_experts_by_layers = _update_expert_weights(
             routed_experts_weights_of_layer=routed_experts_weights_of_layer,
             old_expert_location_metadata=old_expert_location_metadata,
             new_expert_location_metadata=new_expert_location_metadata,
             update_layer_ids=update_layer_ids,
-            nnodes=nnodes,
+            nnodes=topology_num_nodes,
             rank=rank,
         )
         old_expert_location_metadata.update(
@@ -108,7 +116,7 @@ def _update_expert_weights_with_canary(
         canary_tensor = (
             _get_canary_value(old_expert_location_metadata, layer_id)
             .clone()
-            .to(device=get_global_server_args().device, non_blocking=True)
+            .to(device=get_device().device, non_blocking=True)
         )
         routed_experts_weights_of_layer[layer_id].append(canary_tensor)
 
@@ -144,6 +152,18 @@ def _update_expert_weights_raw(
 ):
     log_metrics = get_bool_env_var("SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS")
 
+    if _is_npu:
+        return update_expert_weights_with_staging(
+            weights_by_layer=routed_experts_weights_of_layer,
+            old_metadata=old_expert_location_metadata,
+            new_metadata=new_expert_location_metadata,
+            layer_ids=update_layer_ids,
+            nnodes=nnodes,
+            rank=rank,
+            log_metrics=log_metrics,
+            update_layer_fn=update_expert_weights_single_layer,
+        )
+
     temp_buffers = create_temp_buffers(
         routed_experts_weights_of_layer[update_layer_ids[0]]
     )
@@ -178,7 +198,37 @@ def _update_expert_weights_raw(
 
 
 def create_temp_buffers(sample_tensors):
-    return [torch.empty_like(tensor) for tensor in sample_tensors]
+    return [
+        (
+            torch.empty_like(t)
+            if _is_dense(t[0])
+            else torch.empty_like(t, memory_format=torch.contiguous_format)
+        )
+        for t in sample_tensors
+    ]
+
+
+def _is_dense(t: torch.Tensor) -> bool:
+    """Whether `t` covers its memory without gaps, so P2P can move it as is."""
+    expected = 1
+    for stride, size in sorted(zip(t.stride(), t.shape)):
+        if size == 1:
+            continue
+        if stride != expected:
+            return False
+        expected *= size
+    return True
+
+
+def _int64_view(t: torch.Tensor) -> Optional[torch.Tensor]:
+    size = t.element_size()
+    if t.dim() == 0 or t.stride(-1) != 1 or t.shape[-1] * size % 8:
+        return None
+    if any(stride * size % 8 for stride in t.stride()[:-1]):
+        return None
+    if t.storage_offset() * size % 8:
+        return None
+    return t.view(torch.int64)
 
 
 def update_expert_weights_single_layer(
@@ -218,6 +268,20 @@ def update_expert_weights_single_layer(
 
     num_physical_experts = len(old_physical_to_logical_map)
     num_tensors = len(routed_experts_weights)
+    # Sends need each expert's slice dense; stage tensors whose slices are not
+    # (e.g. Mega MoE weights localized across locality domains), moving them
+    # through int64 views when every layout allows it.
+    routed_experts_weights = list(routed_experts_weights)
+    temp_buffers = list(temp_buffers)
+    send_weights = list(routed_experts_weights)
+    for i, weight in enumerate(routed_experts_weights):
+        if _is_dense(weight[0]):
+            continue
+        send = torch.empty_like(weight, memory_format=torch.contiguous_format)
+        views = [_int64_view(t) for t in (weight, temp_buffers[i], send)]
+        if all(v is not None for v in views):
+            routed_experts_weights[i], temp_buffers[i], send = views
+        send_weights[i] = send.copy_(routed_experts_weights[i])
 
     self_node_id = rank // num_gpu_per_node
 
@@ -401,9 +465,7 @@ def update_expert_weights_single_layer(
                 [
                     P2POp(
                         op=torch.distributed.isend,
-                        tensor=_get_tensor(
-                            routed_experts_weights, i, src_expert_location
-                        ),
+                        tensor=_get_tensor(send_weights, i, src_expert_location),
                         peer=dst_rank,
                     )
                     for dst_rank in all_dst_ranks
@@ -485,31 +547,23 @@ def update_expert_weights_single_layer(
         if len(p2p_ops) == 0:
             return
 
-        if _is_hip:
-            # Submit P2P ops in batches to prevent RCCL GPU-side
-            # accumulation hangs. All ranks use the same expert_id ranges
-            # (based on num_physical_experts) to ensure matching send/recv
-            # pairs land in the same batch. Setting batch_chunk_size >=
-            # num_physical_experts disables batching behavior.
-            batch_chunk_size = get_int_env_var(
-                "SGLANG_EPLB_ROCM_P2P_BATCH_CHUNK_SIZE", 32
-            )
-            ops_by_expert = {eid: ops for eid, ops in sorted_infos}
-            for start in range(0, num_physical_experts, batch_chunk_size):
-                batch_ops = []
-                for eid in range(
-                    start, min(start + batch_chunk_size, num_physical_experts)
-                ):
-                    if eid in ops_by_expert:
-                        batch_ops.extend(ops_by_expert[eid])
-                if batch_ops:
-                    reqs = torch.distributed.batch_isend_irecv(batch_ops)
-                    for req in reqs:
-                        req.wait()
-        else:
-            reqs = torch.distributed.batch_isend_irecv(p2p_ops)
-            for req in reqs:
-                req.wait()
+        # Submit P2P ops in batches to prevent NCCL/RCCL GPU-side accumulation
+        # hangs on large rebalances. All ranks use the same expert_id ranges
+        # (based on num_physical_experts) so matching send/recv pairs land in
+        # the same batch. Set batch_chunk_size >= num_physical_experts to disable.
+        batch_chunk_size = envs.SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE.get()
+        ops_by_expert = {eid: ops for eid, ops in sorted_infos}
+        for start in range(0, num_physical_experts, batch_chunk_size):
+            batch_ops = []
+            for eid in range(
+                start, min(start + batch_chunk_size, num_physical_experts)
+            ):
+                if eid in ops_by_expert:
+                    batch_ops.extend(ops_by_expert[eid])
+            if batch_ops:
+                reqs = torch.distributed.batch_isend_irecv(batch_ops)
+                for req in reqs:
+                    req.wait()
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (

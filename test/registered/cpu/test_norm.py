@@ -1,26 +1,29 @@
-import itertools
-import unittest
+import sys
 from typing import Optional, Tuple, Union
 
+import pytest
+import sgl_kernel  # noqa: F401
 import torch
-from utils import make_non_contiguous, parametrize, precision
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.cpu_test_utils import make_non_contiguous, precision
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu-intel")
 register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
 
 torch.manual_seed(1234)
 
+DTYPES = [torch.float16, torch.bfloat16]
+DTYPE_IDS = ["float16", "bfloat16"]
+eps = 1e-6
 
-class TestNorm(CustomTestCase):
 
+class TestNorm:
     def _forward_native(
         self,
         x: torch.Tensor,
         weight: torch.Tensor,
-        variance_epsilon: float = 1e-6,
+        variance_epsilon: float = eps,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         orig_dtype = x.dtype
@@ -41,7 +44,7 @@ class TestNorm(CustomTestCase):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
 
     def _gemma3_rmsnorm_native(
-        self, x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float = 1e-6
+        self, x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float = eps
     ):
         output = self._norm(x.float(), variance_epsilon)
         output = output * (1.0 + weight.float())
@@ -51,7 +54,7 @@ class TestNorm(CustomTestCase):
         self,
         x: torch.Tensor,
         weight: torch.Tensor,
-        variance_epsilon: float = 1e-6,
+        variance_epsilon: float = eps,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         orig_dtype = x.dtype
@@ -66,144 +69,127 @@ class TestNorm(CustomTestCase):
         x = x.to(orig_dtype)
         return x if residual is None else (x, residual)
 
-    @parametrize(
-        m=[4096, 1024],
-        n=[4096, 4109],
-        dtype=[torch.float16, torch.bfloat16],
-    )
-    def test_norm(self, m, n, dtype):
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize("hidden_size", [2048, 512])
+    @pytest.mark.parametrize("batch_size", [32, 121])
+    def test_l2norm(self, batch_size, hidden_size, dtype):
 
-        x = torch.randn([m, n], dtype=dtype)
-        x = make_non_contiguous(x)
-        hidden_size = x.size(-1)
-        weight = torch.randn(hidden_size, dtype=dtype)
-        variance_epsilon = 1e-6
-
-        out = torch.ops.sgl_kernel.rmsnorm_cpu(x, weight, variance_epsilon)
-        ref_out = self._forward_native(x, weight, variance_epsilon)
-
-        atol = rtol = precision[ref_out.dtype]
-        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
-
-        ref_x = x.clone()
-        residual = torch.randn([m, hidden_size], dtype=dtype)
-        ref_residual = residual.clone()
-
-        torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(
-            x, residual, weight, variance_epsilon
-        )
-
-        ref_x, ref_residual = self._forward_native(
-            ref_x, weight, variance_epsilon, ref_residual
-        )
-
-        torch.testing.assert_close(x, ref_x, atol=atol, rtol=rtol)
-        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
-
-    @parametrize(
-        l=[1, 2],
-        m=[4096, 1024],
-        n=[4096, 4109],
-        dtype=[torch.float16, torch.bfloat16],
-    )
-    def test_norm_3d(self, l, m, n, dtype):
-
-        x = torch.randn([l, m, n], dtype=dtype)
-        x = make_non_contiguous(x)
-        hidden_size = x.size(-1)
-        weight = torch.randn(hidden_size, dtype=dtype)
-        variance_epsilon = 1e-6
-
-        out = torch.ops.sgl_kernel.rmsnorm_cpu(x, weight, variance_epsilon)
-        ref_out = self._forward_native(x, weight, variance_epsilon)
-
-        atol = rtol = precision[ref_out.dtype]
-        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
-
-        ref_x = x.clone()
-        residual = torch.randn([l, m, hidden_size], dtype=dtype)
-        ref_residual = residual.clone()
-
-        torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(
-            x, residual, weight, variance_epsilon
-        )
-
-        ref_x, ref_residual = self._forward_native(
-            ref_x, weight, variance_epsilon, ref_residual
-        )
-
-        torch.testing.assert_close(x, ref_x, atol=atol, rtol=rtol)
-        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
-
-    @parametrize(
-        m=[4096, 1024],
-        n=[4096, 4109],
-        dtype=[torch.float16, torch.bfloat16],
-    )
-    def test_l2norm(self, m, n, dtype):
-
-        x = torch.randn([m, n], dtype=dtype)
-        hidden_size = x.size(-1)
+        x = torch.randn([batch_size, hidden_size], dtype=dtype)
         fake_ones_weight = torch.ones(hidden_size, dtype=dtype)
-        variance_epsilon = 1e-6
 
-        out = torch.ops.sgl_kernel.l2norm_cpu(x, variance_epsilon)
-        ref_out = self._forward_native(x, fake_ones_weight, variance_epsilon)
+        out = torch.ops.sgl_kernel.l2norm_cpu(x, eps)
+        ref_out = self._forward_native(x, fake_ones_weight, eps)
 
         atol = rtol = precision[ref_out.dtype]
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
-    @parametrize(
-        m=[4096, 1024],
-        n=[4096, 4109],
-        dtype=[torch.float16, torch.bfloat16],
-    )
-    def test_gemma_rmsnorm(self, m, n, dtype):
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize("hidden_size", [2048, 512])
+    @pytest.mark.parametrize("batch_size", [32, 121])
+    @pytest.mark.parametrize("seq_len", [None, 2], ids=["2d", "3d"])
+    def test_rmsnorm(self, seq_len, batch_size, hidden_size, dtype):
 
-        x = torch.randn([m, n], dtype=dtype)
+        if seq_len is None:
+            x = torch.randn([batch_size, hidden_size], dtype=dtype)
+        else:
+            x = torch.randn([batch_size, seq_len, hidden_size], dtype=dtype)
         x = make_non_contiguous(x)
-        hidden_size = x.size(-1)
+        residual = torch.randn(x.shape, dtype=dtype)
         weight = torch.randn(hidden_size, dtype=dtype)
-        variance_epsilon = 1e-6
 
-        out = torch.ops.sgl_kernel.gemma_rmsnorm_cpu(x, weight, variance_epsilon)
-        ref_out = self._gemma_rmsnorm_native(x, weight, variance_epsilon)
+        out = torch.ops.sgl_kernel.rmsnorm_cpu(x, weight, eps)
+        ref_out = self._forward_native(x, weight, eps)
 
         atol = rtol = precision[ref_out.dtype]
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
         ref_x = x.clone()
-        residual = torch.randn([m, hidden_size], dtype=dtype)
         ref_residual = residual.clone()
 
-        torch.ops.sgl_kernel.gemma_fused_add_rmsnorm_cpu(
-            x, residual, weight, variance_epsilon
+        torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(x, residual, weight, eps)
+
+        ref_x, ref_residual = self._forward_native(ref_x, weight, eps, ref_residual)
+
+        torch.testing.assert_close(x, ref_x, atol=atol, rtol=rtol)
+        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
+
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize("hidden_size", [2048, 256, 33])
+    @pytest.mark.parametrize("batch_size", [32, 121])
+    def test_dual_residual_rmsnorm(self, batch_size, hidden_size, dtype):
+        generator = torch.Generator().manual_seed(batch_size + hidden_size)
+        x = make_non_contiguous(
+            torch.randn(batch_size, hidden_size, dtype=dtype, generator=generator)
         )
+        residual = make_non_contiguous(
+            torch.randn(x.shape, dtype=dtype, generator=generator)
+        )
+        weight1 = torch.randn(hidden_size, dtype=dtype, generator=generator)
+        weight2 = torch.randn(hidden_size, dtype=dtype, generator=generator)
+        original_x, original_residual = x.clone(), residual.clone()
+
+        expected_mid = residual + torch.nn.functional.rms_norm(
+            x.float(), (hidden_size,), weight1.float(), eps
+        ).to(dtype)
+        expected_output = torch.nn.functional.rms_norm(
+            expected_mid.float(), (hidden_size,), weight2.float(), eps
+        ).to(dtype)
+        output, mid = torch.ops.sgl_kernel.fused_dual_residual_rmsnorm_cpu(
+            x, residual, weight1, weight2, eps
+        )
+
+        torch.testing.assert_close(
+            mid, expected_mid, atol=precision[dtype], rtol=precision[dtype]
+        )
+        torch.testing.assert_close(
+            output, expected_output, atol=precision[dtype], rtol=precision[dtype]
+        )
+        torch.testing.assert_close(x, original_x, atol=0, rtol=0)
+        torch.testing.assert_close(residual, original_residual, atol=0, rtol=0)
+        assert mid.data_ptr() != residual.data_ptr()
+        assert output.data_ptr() != x.data_ptr()
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bfloat16"])
+    @pytest.mark.parametrize("hidden_size", [2048, 256, 33])
+    @pytest.mark.parametrize("batch_size", [32, 121])
+    def test_gemma_rmsnorm(self, batch_size, hidden_size, dtype):
+
+        x = torch.randn([batch_size, hidden_size], dtype=dtype)
+        x = make_non_contiguous(x)
+        weight = torch.randn(hidden_size, dtype=dtype)
+
+        out = torch.ops.sgl_kernel.gemma_rmsnorm_cpu(x, weight, eps)
+        ref_out = self._gemma_rmsnorm_native(x, weight, eps)
+
+        atol = rtol = precision[ref_out.dtype]
+        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
+
+        ref_x = x.clone()
+        residual = torch.randn([batch_size, hidden_size], dtype=dtype)
+        ref_residual = residual.clone()
+
+        torch.ops.sgl_kernel.gemma_fused_add_rmsnorm_cpu(x, residual, weight, eps)
 
         ref_x, ref_residual = self._gemma_rmsnorm_native(
-            ref_x, weight, variance_epsilon, ref_residual
+            ref_x, weight, eps, ref_residual
         )
 
         torch.testing.assert_close(x, ref_x, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
 
-    @parametrize(
-        m=[4096, 1024],
-        n=[4096, 4109],
-        dtype=[torch.float16, torch.bfloat16],
-    )
-    def test_gemma3_rmsnorm(self, m, n, dtype):
+    @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bfloat16"])
+    @pytest.mark.parametrize("hidden_size", [128, 256])
+    @pytest.mark.parametrize("batch_size", [32, 121])
+    def test_gemma3_rmsnorm(self, batch_size, hidden_size, dtype):
         x_list = [
-            torch.randn([m, n], dtype=dtype),
-            torch.randn([1, m, 2, n], dtype=dtype),
+            torch.randn([batch_size, hidden_size], dtype=dtype),
+            torch.randn([batch_size, 16, 2, hidden_size], dtype=dtype),
         ]
         for x in x_list:
             x = make_non_contiguous(x)
-            hidden_size = x.size(-1)
             weight = torch.randn(hidden_size, dtype=dtype)
-            variance_epsilon = 1e-6
-            out = torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, weight, variance_epsilon)
-            ref_out = self._gemma3_rmsnorm_native(x, weight, variance_epsilon)
+            out = torch.ops.sgl_kernel.gemma3_rmsnorm_cpu(x, weight, eps)
+            ref_out = self._gemma3_rmsnorm_native(x, weight, eps)
 
             atol = rtol = precision[ref_out.dtype]
             torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
@@ -212,7 +198,7 @@ class TestNorm(CustomTestCase):
         self,
         x: torch.Tensor,
         weight: torch.Tensor,
-        variance_epsilon: float = 1e-6,
+        variance_epsilon: float = eps,
         scale_shift: float = 0.0,
         with_scale: bool = True,
     ):
@@ -221,53 +207,40 @@ class TestNorm(CustomTestCase):
             output = output * (weight.float() + scale_shift)
         return output.type_as(x)
 
-    @parametrize(
-        m=[4096, 1024],
-        n=[4096, 4109],
-        dtype=[torch.float16, torch.bfloat16],
-    )
-    def test_gemma4_rmsnorm(self, m, n, dtype):
-        for scale_shift, with_scale in [
-            (0.0, True),
-            (1.0, True),
-            (0.0, False),
-            (1.0, False),
-        ]:
-            x_list = [
-                torch.randn([m, n], dtype=dtype),
-                torch.randn([4, m, n], dtype=dtype),
-            ]
-            # Add non-block-contiguous 3D input
-            base = torch.randn([4, 2 * m, n], dtype=dtype)
-            x_list.append(base[:, :m, :])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bfloat16"])
+    @pytest.mark.parametrize("hidden_size", [128, 2048])
+    @pytest.mark.parametrize("batch_size", [32, 121])
+    @pytest.mark.parametrize("scale_shift", [0.0, 1.0], ids=["shift0.0", "shift1.0"])
+    @pytest.mark.parametrize("with_scale", [True, False], ids=["scale", "no-scale"])
+    def test_gemma4_rmsnorm(
+        self, batch_size, hidden_size, dtype, scale_shift, with_scale
+    ):
+        x_list = [
+            torch.randn([batch_size, hidden_size], dtype=dtype),
+            torch.randn([batch_size, 4, hidden_size], dtype=dtype),
+        ]
 
-            for x in x_list:
-                x = make_non_contiguous(x)
-                hidden_size = x.size(-1)
-                weight = torch.randn(hidden_size, dtype=dtype)
-                variance_epsilon = 1e-6
+        for x in x_list:
+            x = make_non_contiguous(x)
+            weight = torch.randn(hidden_size, dtype=dtype)
 
-                out = torch.ops.sgl_kernel.gemma4_rmsnorm_cpu(
-                    x, weight, variance_epsilon, scale_shift, with_scale
-                )
-                ref_out = self._gemma4_rmsnorm_native(
-                    x, weight, variance_epsilon, scale_shift, with_scale
-                )
+            out = torch.ops.sgl_kernel.gemma4_rmsnorm_cpu(
+                x, weight, eps, scale_shift, with_scale
+            )
+            ref_out = self._gemma4_rmsnorm_native(
+                x, weight, eps, scale_shift, with_scale
+            )
 
-                atol = rtol = precision[ref_out.dtype]
-                torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
+            atol = rtol = precision[ref_out.dtype]
+            torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
 
-class TestFusedRMSNormGated(CustomTestCase):
-    M = [4096, 1024]
-    N = [4096, 4096 + 13]
-    dtype = [torch.float16, torch.bfloat16]
-
+class TestFusedRMSNormGated:
     def _forward_native(
         self,
         hidden_states: torch.Tensor,
         weight: torch.Tensor,
-        variance_epsilon: float = 1e-6,
+        variance_epsilon: float = eps,
         gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         input_dtype = hidden_states.dtype
@@ -280,37 +253,108 @@ class TestFusedRMSNormGated(CustomTestCase):
 
         return hidden_states.to(input_dtype)
 
-    def _norm_test(self, m, n, dtype):
-
-        x = torch.randn([m, n], dtype=dtype)
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize("hidden_size", [64, 1024 + 13])
+    @pytest.mark.parametrize("batch_size", [32, 121])
+    def test_fused_rmsnorm_gated(self, batch_size, hidden_size, dtype):
+        x = torch.randn([batch_size, hidden_size], dtype=dtype)
         x = make_non_contiguous(x)
-        batch_size = x.size(0)
-        hidden_size = x.size(-1)
         weight = torch.randn(hidden_size, dtype=dtype)
-        variance_epsilon = 1e-6
         gate = torch.randn([batch_size, hidden_size], dtype=dtype)
 
-        out = torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
-            x, weight, gate, variance_epsilon
-        )
-        ref_out = self._forward_native(x, weight, variance_epsilon, gate)
+        out = torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(x, weight, gate, eps)
+        ref_out = self._forward_native(x, weight, eps, gate)
 
-        atol = rtol = precision[ref_out.dtype] * 2
+        atol = rtol = precision[ref_out.dtype]
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
-    def test_norm(self):
-        for params in itertools.product(self.M, self.N, self.dtype):
-            with self.subTest(m=params[0], n=params[1], dtype=params[2]):
-                self._norm_test(*params)
+
+class TestFusedQKRMSNorm:
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize(
+        "batch_size,q_size,k_size,v_size",
+        [(1, 256, 64, 64), (17, 512, 128, 128)],
+    )
+    def test_fused_qk_rmsnorm(
+        self, batch_size: int, q_size: int, k_size: int, v_size: int, dtype
+    ):
+        """Q and K split views must be normalized over their distinct full widths."""
+        qkv = torch.randn([batch_size, q_size + k_size + v_size], dtype=dtype)
+        q, k, _ = qkv.split([q_size, k_size, v_size], dim=-1)
+        q_weight = torch.randn(q_size, dtype=dtype)
+        k_weight = torch.randn(k_size, dtype=dtype)
+
+        q_out, k_out = torch.ops.sgl_kernel.fused_qk_rmsnorm_cpu(
+            q, k, q_weight, k_weight, eps
+        )
+        ref_q_out = TestNorm()._forward_native(q, q_weight, eps)
+        ref_k_out = TestNorm()._forward_native(k, k_weight, eps)
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(q_out, ref_q_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_out, ref_k_out, atol=atol, rtol=rtol)
+
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize(
+        "batch_size,q_size,k_size,tp_world_size",
+        [(1, 256, 64, 2), (17, 512, 128, 4)],
+    )
+    def test_fused_qk_rmsnorm_tp(
+        self,
+        batch_size: int,
+        q_size: int,
+        k_size: int,
+        tp_world_size: int,
+        dtype,
+    ):
+        q = torch.randn([batch_size, q_size], dtype=dtype)
+        k = torch.randn([batch_size, k_size], dtype=dtype)
+        q_weight = torch.randn(q_size, dtype=dtype)
+        k_weight = torch.randn(k_size, dtype=dtype)
+
+        q_shards = q.chunk(tp_world_size, dim=-1)
+        k_shards = k.chunk(tp_world_size, dim=-1)
+        q_weight_shards = q_weight.chunk(tp_world_size)
+        k_weight_shards = k_weight.chunk(tp_world_size)
+        local_sum_sq = [
+            torch.ops.sgl_kernel.fused_qk_rmsnorm_sumsq_cpu(q_shard, k_shard)
+            for q_shard, k_shard in zip(q_shards, k_shards)
+        ]
+        global_sum_sq = torch.stack(local_sum_sq).sum(dim=0)
+
+        shard_outputs = [
+            torch.ops.sgl_kernel.fused_qk_rmsnorm_apply_from_stats_cpu(
+                q_shard,
+                k_shard,
+                q_weight_shard,
+                k_weight_shard,
+                global_sum_sq,
+                tp_world_size,
+                eps,
+            )
+            for q_shard, k_shard, q_weight_shard, k_weight_shard in zip(
+                q_shards, k_shards, q_weight_shards, k_weight_shards
+            )
+        ]
+        q_out = torch.cat([output[0] for output in shard_outputs], dim=-1)
+        k_out = torch.cat([output[1] for output in shard_outputs], dim=-1)
+
+        ref_q_out = TestNorm()._forward_native(q, q_weight, eps)
+        ref_k_out = TestNorm()._forward_native(k, k_weight, eps)
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(q_out, ref_q_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_out, ref_k_out, atol=atol, rtol=rtol)
+
+        assert global_sum_sq.shape == (batch_size, 2)
+        assert global_sum_sq.dtype == torch.float32
 
 
-class TestLayerNorm(CustomTestCase):
-
+class TestLayerNorm:
     def _forward_native(
         self,
         x: torch.Tensor,
         weight: torch.Tensor,
-        variance_epsilon: float,
+        variance_epsilon: float = eps,
         residual: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -328,109 +372,266 @@ class TestLayerNorm(CustomTestCase):
         x = x.to(orig_dtype)
         return x if residual is None else (x, residual)
 
-    @parametrize(
-        m=[4096, 1024],
-        n=[4096, 4109],
-        dtype=[torch.float16, torch.bfloat16],
+    @pytest.mark.parametrize("hidden_size", [128, 133], ids=["fixed", "generic"])
+    @pytest.mark.parametrize("ndim", [2, 3], ids=["2d", "3d"])
+    @pytest.mark.parametrize(
+        "input_dtype",
+        [torch.float16, torch.bfloat16, torch.float32],
+        ids=["input-fp16", "input-bf16", "input-fp32"],
     )
-    def test_norm_input_2d(self, m: int, n: int, dtype: torch.dtype) -> None:
-        x = torch.randn([m, n], dtype=dtype)
-        x = make_non_contiguous(x)
-        hidden_size = x.size(-1)
-        weight = torch.randn(hidden_size, dtype=dtype)
-        bias = torch.randn(hidden_size, dtype=dtype)
-        variance_epsilon = 1e-6
-
-        ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, None, variance_epsilon)
-        ref_ln_out = self._forward_native(x, weight, variance_epsilon)
-
-        atol = rtol = precision[ref_ln_out.dtype]
-        torch.testing.assert_close(ln_out, ref_ln_out, atol=atol, rtol=rtol)
-
-        ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, variance_epsilon)
-        ref_ln_out = self._forward_native(
-            x, weight, variance_epsilon, residual=None, bias=bias
-        )
-        torch.testing.assert_close(ln_out, ref_ln_out, atol=atol, rtol=rtol)
-
-        residual = torch.randn([m, hidden_size], dtype=dtype)
-        ref_residual = residual.clone()
-
-        add_ln_out = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
-            x, residual, weight, None, variance_epsilon
-        )
-        ref_add_ln_out, ref_residual = self._forward_native(
-            x, weight, variance_epsilon, residual=ref_residual
-        )
-
-        torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
-        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
-
-        residual = torch.randn([m, hidden_size], dtype=dtype)
-        ref_residual = residual.clone()
-
-        add_ln_out = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
-            x, residual, weight, bias, variance_epsilon
-        )
-        ref_add_ln_out, ref_residual = self._forward_native(
-            x, weight, variance_epsilon, residual=ref_residual, bias=bias
-        )
-
-        torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
-        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
-
-    @parametrize(
-        l=[4096, 1024],
-        m=[1, 4],
-        n=[4096, 4109, 2304],
-        dtype=[torch.float16, torch.bfloat16],
+    @pytest.mark.parametrize(
+        "parameter_dtype",
+        [torch.float16, torch.bfloat16, torch.float32],
+        ids=["parameter-fp16", "parameter-bf16", "parameter-fp32"],
     )
-    def test_norm_input_3d(self, l: int, m: int, n: int, dtype: torch.dtype) -> None:
-        x = torch.randn([l, m, n], dtype=dtype)
-        x = make_non_contiguous(x)
-        hidden_size = x.size(-1)
-        weight = torch.randn(hidden_size, dtype=dtype)
-        bias = torch.randn(hidden_size, dtype=dtype)
-        variance_epsilon = 1e-6
+    @pytest.mark.parametrize("has_bias", [False, True], ids=["no-bias", "bias"])
+    def test_layernorm(
+        self,
+        hidden_size: int,
+        ndim: int,
+        input_dtype: torch.dtype,
+        parameter_dtype: torch.dtype,
+        has_bias: bool,
+    ) -> None:
+        """CPU LayerNorm supports mixed input/parameter dtypes, but one parameter dtype."""
+        shape = [8, hidden_size] if ndim == 2 else [8, 3, hidden_size]
+        x = make_non_contiguous(torch.randn(shape, dtype=input_dtype))
+        weight = torch.randn(hidden_size, dtype=parameter_dtype)
+        bias = torch.randn(hidden_size, dtype=parameter_dtype) if has_bias else None
 
-        ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, None, variance_epsilon)
-        ref_ln_out = self._forward_native(x, weight, variance_epsilon)
+        output = torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, eps)
+        expected = self._forward_native(x, weight, eps, bias=bias)
 
-        atol = rtol = precision[ref_ln_out.dtype]
-        torch.testing.assert_close(ln_out, ref_ln_out, atol=atol, rtol=rtol)
+        assert output.dtype == input_dtype
+        atol = rtol = precision[input_dtype]
+        torch.testing.assert_close(output, expected, atol=atol, rtol=rtol)
 
-        ln_out = torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, variance_epsilon)
-        ref_ln_out = self._forward_native(
-            x, weight, variance_epsilon, residual=None, bias=bias
+        if input_dtype in DTYPES and parameter_dtype == input_dtype:
+            residual = torch.randn(shape, dtype=input_dtype)
+            expected_residual = residual.clone()
+            output = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
+                x, residual, weight, bias, eps
+            )
+            expected, expected_residual = self._forward_native(
+                x, weight, eps, residual=expected_residual, bias=bias
+            )
+
+            torch.testing.assert_close(output, expected, atol=atol, rtol=rtol)
+            torch.testing.assert_close(
+                residual, expected_residual, atol=atol, rtol=rtol
+            )
+
+    def test_layernorm_rejects_mismatched_parameter_dtypes(self) -> None:
+        hidden_size = 128
+        x = torch.randn(8, hidden_size, dtype=torch.bfloat16)
+        weight = torch.randn(hidden_size, dtype=torch.bfloat16)
+        bias = torch.randn(hidden_size, dtype=torch.float32)
+
+        with pytest.raises(RuntimeError, match="bias dtype to match weight dtype"):
+            torch.ops.sgl_kernel.layernorm_cpu(x, weight, bias, eps)
+
+
+class TestFusedQKGemmaRMSNorm:
+    def _gemma_rmsnorm_per_head_native(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        head_dim: int,
+        variance_epsilon: float = eps,
+    ) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x_f = x.to(torch.float32).reshape(-1, head_dim)
+        variance = x_f.pow(2).mean(dim=-1, keepdim=True)
+        x_f = x_f * torch.rsqrt(variance + variance_epsilon)
+        x_f = x_f * (1.0 + weight.to(torch.float32))
+        return x_f.to(orig_dtype).reshape_as(x)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bfloat16"])
+    @pytest.mark.parametrize(
+        "batch_size,num_head,num_head_kv,head_dim",
+        [
+            (8, 4, 2, 128),
+            (17, 8, 2, 64),
+            (5, 3, 1, 96),
+        ],
+    )
+    def test_fused_qk_gemma_rmsnorm(
+        self, batch_size: int, num_head: int, num_head_kv: int, head_dim: int, dtype
+    ):
+        q = torch.randn([batch_size, num_head * head_dim], dtype=dtype)
+        k = torch.randn([batch_size, num_head_kv * head_dim], dtype=dtype)
+
+        # Keep last dim contiguous but make base storage non-contiguous to stress stride handling.
+        q = make_non_contiguous(q)
+        k = make_non_contiguous(k)
+
+        q_weight = torch.randn(head_dim, dtype=dtype)
+        k_weight = torch.randn(head_dim, dtype=dtype)
+
+        q_out, k_out = torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_cpu(
+            q, k, q_weight, k_weight, eps, head_dim
         )
-        torch.testing.assert_close(ln_out, ref_ln_out, atol=atol, rtol=rtol)
 
-        residual = torch.randn([l, m, hidden_size], dtype=dtype)
-        ref_residual = residual.clone()
+        ref_q_out = self._gemma_rmsnorm_per_head_native(q, q_weight, head_dim, eps)
+        ref_k_out = self._gemma_rmsnorm_per_head_native(k, k_weight, head_dim, eps)
 
-        add_ln_out = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
-            x, residual, weight, None, variance_epsilon
+        atol = rtol = precision[ref_q_out.dtype]
+        torch.testing.assert_close(q_out, ref_q_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_out, ref_k_out, atol=atol, rtol=rtol)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bfloat16"])
+    @pytest.mark.parametrize(
+        "batch_size,num_head,num_head_kv,head_dim",
+        [
+            (8, 4, 2, 128),
+            (17, 8, 2, 64),
+            (5, 3, 1, 96),
+        ],
+    )
+    def test_fused_qk_gemma_rmsnorm_with_gate(
+        self, batch_size: int, num_head: int, num_head_kv: int, head_dim: int, dtype
+    ):
+        q = torch.randn([batch_size, num_head, head_dim], dtype=dtype)
+        gate = torch.randn([batch_size, num_head, head_dim], dtype=dtype)
+        q_gate = torch.cat((q, gate), dim=-1).reshape(
+            batch_size, num_head * head_dim * 2
         )
-        ref_add_ln_out, ref_residual = self._forward_native(
-            x, weight, variance_epsilon, ref_residual
+        k = torch.randn([batch_size, num_head_kv * head_dim], dtype=dtype)
+
+        q_gate = make_non_contiguous(q_gate)
+        k = make_non_contiguous(k)
+
+        q_weight = torch.randn(head_dim, dtype=dtype)
+        k_weight = torch.randn(head_dim, dtype=dtype)
+
+        q_out, k_out, gate_out = (
+            torch.ops.sgl_kernel.fused_qk_gemma_rmsnorm_with_gate_cpu(
+                q_gate, k, q_weight, k_weight, eps, head_dim, num_head
+            )
         )
 
-        torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
-        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
+        ref_q_out = self._gemma_rmsnorm_per_head_native(q, q_weight, head_dim, eps)
+        ref_k_out = self._gemma_rmsnorm_per_head_native(k, k_weight, head_dim, eps)
 
-        residual = torch.randn([l, m, hidden_size], dtype=dtype)
-        ref_residual = residual.clone()
-
-        add_ln_out = torch.ops.sgl_kernel.fused_add_layernorm_cpu(
-            x, residual, weight, bias, variance_epsilon
+        atol = rtol = precision[ref_q_out.dtype]
+        torch.testing.assert_close(
+            q_out, ref_q_out.reshape(-1, head_dim), atol=atol, rtol=rtol
         )
-        ref_add_ln_out, ref_residual = self._forward_native(
-            x, weight, variance_epsilon, residual=ref_residual, bias=bias
+        torch.testing.assert_close(
+            k_out, ref_k_out.reshape(-1, head_dim), atol=atol, rtol=rtol
+        )
+        torch.testing.assert_close(
+            gate_out, gate.reshape(-1, head_dim), atol=atol, rtol=rtol
         )
 
-        torch.testing.assert_close(add_ln_out, ref_add_ln_out, atol=atol, rtol=rtol)
-        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
+
+class TestFusedQKNorm:
+    def _norm_per_head_native(
+        self, x: torch.Tensor, weight: torch.Tensor, head_dim: int, eps: float
+    ):
+        out = x.reshape(-1, head_dim).float()
+        out = out * torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + eps)
+        out = out * weight.float()
+        return out.to(x.dtype).reshape(x.shape)
+
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize(
+        "batch_size,num_head,num_head_kv,head_dim",
+        [
+            (1, 16, 2, 128),
+            (9, 8, 1, 64),
+            (256, 16, 2, 128),
+            (4109, 3, 1, 96),
+        ],
+    )
+    def test_fused_qk_norm(
+        self, batch_size: int, num_head: int, num_head_kv: int, head_dim: int, dtype
+    ):
+        q_size = num_head * head_dim
+        kv_size = num_head_kv * head_dim
+        qkv = torch.randn([batch_size, q_size + 2 * kv_size], dtype=dtype)
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        v_before = v.clone()
+
+        q_weight = torch.randn(head_dim, dtype=dtype)
+        k_weight = torch.randn(head_dim, dtype=dtype)
+
+        ref_q_out = self._norm_per_head_native(q, q_weight, head_dim, eps)
+        ref_k_out = self._norm_per_head_native(k, k_weight, head_dim, eps)
+
+        torch.ops.sgl_kernel.fused_qk_norm_cpu(q, k, q_weight, k_weight, eps)
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(q, ref_q_out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k, ref_k_out, atol=atol, rtol=rtol)
+        # The in-place write must not spill past the q/k head rows into V.
+        torch.testing.assert_close(v, v_before, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bfloat16"])
+    @pytest.mark.parametrize("is_neox", [False, True], ids=["interleaved", "neox"])
+    @pytest.mark.parametrize(
+        "num_head,num_head_kv,head_dim", [(16, 2, 64), (8, 1, 128)]
+    )
+    def test_fused_qk_norm_rope(
+        self,
+        dtype,
+        is_neox: bool,
+        num_head: int,
+        num_head_kv: int,
+        head_dim: int,
+    ):
+        batch_size = 3
+        q_size = num_head * head_dim
+        kv_size = num_head_kv * head_dim
+        q = torch.randn([batch_size, q_size], dtype=dtype)
+        k = torch.randn([batch_size, kv_size], dtype=dtype)
+        q_weight = torch.randn(head_dim, dtype=dtype)
+        k_weight = torch.randn(head_dim, dtype=dtype)
+        position_ids = torch.arange(batch_size, dtype=torch.int32)
+        base = 10000.0
+
+        half = head_dim // 2
+        freqs = base ** (-2.0 * torch.arange(half, dtype=torch.float32) / head_dim)
+        theta = position_ids.to(torch.float32)[:, None] * freqs[None, :]
+        cos_sin_cache = torch.cat([torch.cos(theta), torch.sin(theta)], dim=-1).to(
+            dtype
+        )
+
+        def apply_rope(x: torch.Tensor) -> torch.Tensor:
+            rows = x.reshape(batch_size, -1, head_dim).float()
+            # Use the same quantized cache as the kernel, with FP32 arithmetic.
+            cache = cos_sin_cache[position_ids.long()].float()
+            cos = cache[:, None, :half]
+            sin = cache[:, None, half:]
+            if is_neox:
+                x0, y0 = rows[..., :half], rows[..., half:]
+                rotated = torch.cat([x0 * cos - y0 * sin, y0 * cos + x0 * sin], dim=-1)
+            else:
+                x0, y0 = rows[..., 0::2], rows[..., 1::2]
+                rotated = torch.stack(
+                    [x0 * cos - y0 * sin, y0 * cos + x0 * sin], dim=-1
+                ).flatten(-2)
+            return rotated.to(x.dtype).reshape_as(x)
+
+        ref_q = apply_rope(self._norm_per_head_native(q, q_weight, head_dim, eps))
+        ref_k = apply_rope(self._norm_per_head_native(k, k_weight, head_dim, eps))
+
+        torch.ops.sgl_kernel.fused_qk_norm_rope_cpu(
+            q,
+            k,
+            q_weight,
+            k_weight,
+            eps,
+            is_neox,
+            position_ids,
+            cos_sin_cache,
+            head_dim,
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(q, ref_q, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k, ref_k, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))

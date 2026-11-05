@@ -6,14 +6,18 @@ HOSTNAME_VALUE=$(hostname)
 GPU_FAMILY=""
 
 # Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
-if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+# Non-ARC runners have no such hostname and set AMD_CI_GPU_ARCH instead.
+if [[ -n "${AMD_CI_GPU_ARCH:-}" ]]; then
+  GPU_FAMILY="${AMD_CI_GPU_ARCH}"
+  echo "Using GPU family from AMD_CI_GPU_ARCH: ${GPU_FAMILY}"
+elif [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
   GPU_FAMILY="${BASH_REMATCH[1]}"
   echo "Detected GPU family from hostname: ${GPU_FAMILY}"
 else
   echo "Warning: could not parse GPU family from '${HOSTNAME_VALUE}'"
 fi
 
-WORKDIR="/sglang-checkout/test/srt"
+WORKDIR="/sglang-checkout/test"
 declare -A ENV_MAP=(
   [SGLANG_IS_IN_CI_AMD]=1
   [SGLANG_IS_IN_CI]=1
@@ -21,10 +25,6 @@ declare -A ENV_MAP=(
   # the MXFP4 EAGLE-MTP decode path and abort the queue with an HSA hardware
   # exception.
   [SGLANG_ENABLE_ASYNC_ASSERT]=0
-  # Disabled on AMD: the per-step NaN-logit probe/sanitize kernels (#27883) in
-  # the sampler hot path lower single-batch decode fwd_occupancy below the
-  # base-a sanity threshold.
-  [SGLANG_SANITIZE_NAN_LOGITS]=0
   [SGLANG_USE_AITER]=1
 )
 

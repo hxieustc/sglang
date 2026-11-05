@@ -17,20 +17,20 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 # CuteDSL prefill kernel only exists on Blackwell. Single-GPU kernel-unit suite,
 # same slot as the GDN prefill test.
-register_cuda_ci(est_time=60, suite="base-b-kernel-unit-1-gpu-b200")
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10):
+if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10):
     pytest.skip(
         "KDA CuteDSL prefill requires CUDA SM10x (Blackwell).",
         allow_module_level=True,
     )
 
-from sglang.srt.layers.attention.fla.index import (  # noqa: E402
+from sglang.kernels.ops.attention.fla.index import (  # noqa: E402
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
-from sglang.srt.layers.attention.fla.kda import fused_recurrent_kda  # noqa: E402
-from sglang.srt.layers.attention.linear.kernels.kda_blackwell import (  # noqa: E402
+from sglang.kernels.ops.attention.fla.kda import fused_recurrent_kda  # noqa: E402
+from sglang.kernels.ops.attention.linear.kda_blackwell import (  # noqa: E402
     chunk_kda_cutedsl,
     prepare_metadata,
 )
@@ -218,6 +218,133 @@ def test_kda_chunk_cutedsl_realistic_gate():
     torch.cuda.synchronize()
     assert torch.isfinite(o).all() and torch.isfinite(ht).all()
     assert (o.float() - ref_o[0].float()).abs().max().item() < 1e-2
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("replay_entry", [False, True])
+def test_kda_chunk_cutedsl_pool_mode_matches_dense(
+    state_dtype: torch.dtype, replay_entry: bool
+):
+    """Pool mode (h0_indices) must reproduce the dense gather/scatter path
+    bit-for-bit: same o, same final-state rows written in place at the indexed
+    pool slots, and every other pool row untouched."""
+    torch.manual_seed(3)
+    num_seqs = 5
+    seq_lens = torch.randint(1, 130, (num_seqs,), dtype=torch.int32)
+    cu_seqlens = torch.zeros(num_seqs + 1, device="cuda", dtype=torch.int32)
+    cu_seqlens[1:] = seq_lens.to("cuda").cumsum(0)
+    total_tokens = int(cu_seqlens[-1].item())
+
+    num_heads = 8
+    head_dim = 128
+    scale = head_dim**-0.5
+
+    q = _l2norm(torch.randn(1, total_tokens, num_heads, head_dim, device="cuda"))
+    k = _l2norm(torch.randn(1, total_tokens, num_heads, head_dim, device="cuda"))
+    v = torch.randn(1, total_tokens, num_heads, head_dim, device="cuda")
+    A_log = torch.randn(num_heads, device="cuda") * 0.5 - 1.5
+    dt_bias = torch.randn(num_heads, head_dim, device="cuda") * 0.1
+    g_raw = torch.randn(1, total_tokens, num_heads, head_dim, device="cuda")
+    g_act = -A_log.exp().view(1, 1, num_heads, 1) * F.softplus(
+        g_raw + dt_bias.view(1, 1, num_heads, head_dim)
+    )
+    beta = torch.sigmoid(torch.randn(1, total_tokens, num_heads, device="cuda")).float()
+
+    h0_dense = (
+        torch.randn(num_seqs, num_heads, head_dim, head_dim, device="cuda") * 0.05
+    ).to(state_dtype)
+
+    # Same states scattered into a larger pool at shuffled slots.
+    num_slots = 64
+    pool = (
+        torch.randn(num_slots, num_heads, head_dim, head_dim, device="cuda") * 0.05
+    ).to(state_dtype)
+    other_parts = {}
+    if replay_entry:
+        from sglang.srt.mem_cache.kv.decl import (
+            StateGeometry,
+            StateReplay,
+            with_state_replay,
+        )
+        from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+
+        geometry = with_state_replay(
+            StateGeometry(
+                conv_state_shapes=((3, 3072),),
+                conv_dtype=torch.bfloat16,
+                temporal_state_shape=(num_heads, head_dim, head_dim),
+                temporal_dtype=state_dtype,
+            ),
+            StateReplay(
+                decode=True,
+                speculative=False,
+                is_kda=True,
+                cache_len=16,
+                key_heads=num_heads,
+            ),
+            layer_ids=(0, 1),
+            speculative_num_draft_tokens=None,
+        )
+        spec = MambaSubPoolSpec(
+            name="mamba",
+            layer_num=2,
+            grow_direction="down",
+            conv_state_shapes=geometry.conv_state_shapes,
+            conv_dtype=geometry.conv_dtype,
+            temporal_state_shape=geometry.temporal_state_shape,
+            temporal_dtype=geometry.temporal_dtype,
+            extra_parts=geometry.extra_parts,
+            replay=geometry.replay,
+        )
+        raw = torch.zeros(
+            num_slots * spec.entry_bytes(), dtype=torch.uint8, device="cuda"
+        )
+        parts = spec.entry_layout().views(raw, num_slots)
+        parts["temporal"][1].copy_(pool)
+        pool = parts["temporal"][1]
+        other_parts = {
+            name: value for name, value in parts.items() if name != "temporal"
+        }
+        other_parts["other_layer"] = parts["temporal"][0]
+        assert pool.stride(0) * pool.element_size() == spec.entry_bytes()
+        assert pool.stride(0) % 16 == 0
+    slots = torch.randperm(num_slots, device="cuda")[:num_seqs].to(torch.int32)
+    pool[slots.long()] = h0_dense
+    pool_before = pool.clone()
+
+    q_b, k_b, v_b = q[0].bfloat16(), k[0].bfloat16(), v[0].bfloat16()
+    o_dense, ht_dense = chunk_kda_cutedsl(
+        q_b,
+        k_b,
+        v_b,
+        g_act[0].float(),
+        beta[0].float(),
+        h0_dense.clone(),
+        cu_seqlens,
+        scale,
+    )
+    o_pool, ht_pool = chunk_kda_cutedsl(
+        q_b,
+        k_b,
+        v_b,
+        g_act[0].float(),
+        beta[0].float(),
+        pool,
+        cu_seqlens,
+        scale,
+        h0_indices=slots,
+    )
+    torch.cuda.synchronize()
+
+    # Same kernels and math; only the state addressing differs -> bit-identical.
+    assert ht_pool is pool
+    assert torch.equal(o_pool, o_dense)
+    assert torch.equal(pool[slots.long()], ht_dense)
+    untouched = torch.ones(num_slots, dtype=torch.bool, device="cuda")
+    untouched[slots.long()] = False
+    assert torch.equal(pool[untouched], pool_before[untouched])
+    for value in other_parts.values():
+        assert torch.count_nonzero(value) == 0
 
 
 if __name__ == "__main__":
